@@ -1877,7 +1877,12 @@ fn handle_poll(
 
     let result = common::poll_messages(db, instance_name, timeout as u64, ctx.is_background);
 
-    if result.timed_out {
+    let keep_hook_boundary_listening = db
+        .get_instance_full(instance_name)
+        .ok()
+        .flatten()
+        .is_some_and(|data| crate::instance_lifecycle::is_hook_only_claude_session(&data, db));
+    if result.timed_out && !keep_hook_boundary_listening {
         lifecycle::set_status(
             db,
             instance_name,
@@ -5062,6 +5067,34 @@ mod tests {
         db.set_session_binding(session_id, instance_name).unwrap();
         db.mark_claude_session_validated(session_id, instance_name)
             .unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn hook_only_stop_poll_timeout_remains_listening() {
+        crate::config::Config::init();
+        let (_dir, _guard, db) = make_isolated_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                 (name, session_id, tool, status, status_context, status_time,
+                  created_at, wait_timeout)
+                 VALUES ('risa', 'sess-risa', 'claude', 'active', 'prompt', 0, 1, 0)",
+                [],
+            )
+            .unwrap();
+        db.set_session_binding("sess-risa", "risa").unwrap();
+        let instance = db.get_instance_full("risa").unwrap().unwrap();
+
+        let (code, stdout, ack) = handle_poll(&db, &make_ctx(), "risa", &instance);
+
+        assert_eq!(code, 0);
+        assert!(stdout.is_empty());
+        assert!(ack.is_none());
+        let after = db.get_instance_full("risa").unwrap().unwrap();
+        assert_eq!(after.status, ST_LISTENING);
+        assert!(after.status_context.is_empty());
+        assert!(db.has_session_binding("risa"));
     }
 
     #[test]

@@ -398,6 +398,12 @@ fn start_rebind(
         // unbound and the identity it replaces is never cleaned up.
         session_id = resolve_claude_session_id(&ctx.raw_env);
     }
+    if session_id.is_none() && ctx.tool == crate::tool::Tool::Codex {
+        // Codex Desktop is not launched through hcom, so it has no
+        // HCOM_PROCESS_ID/process binding. Its thread id is the stable
+        // session identity exposed to commands run inside the task.
+        session_id = resolve_codex_session_id(ctx);
+    }
     let current_name = if !explicit_current_name.is_empty() {
         explicit_current_name.to_string()
     } else if let Some(ref sid) = session_id {
@@ -662,6 +668,15 @@ fn resolve_claude_session_id(env: &HashMap<String, String>) -> Option<String> {
         .find_map(|key| env.get(key).filter(|value| !value.is_empty()).cloned())
 }
 
+/// Resolve the stable Codex task identity exposed to commands inside Desktop.
+fn resolve_codex_session_id(ctx: &HcomContext) -> Option<String> {
+    ctx.codex_thread_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_owned)
+}
+
 /// Live local Claude instances in this directory that no session id points at.
 ///
 /// These are the plausible earlier identities of a session that exposes no id
@@ -744,18 +759,22 @@ fn start_bare(
     }
 
     let tool = ctx.tool.as_str();
-    let claude_session_id = (ctx.tool == crate::tool::Tool::Claude)
-        .then(|| resolve_claude_session_id(&ctx.raw_env))
-        .flatten();
+    let session_id = match ctx.tool {
+        crate::tool::Tool::Claude => resolve_claude_session_id(&ctx.raw_env),
+        crate::tool::Tool::Codex => resolve_codex_session_id(ctx),
+        _ => None,
+    };
 
     if explicit_name.is_none()
-        && let Some(ref session_id) = claude_session_id
+        && let Some(ref session_id) = session_id
         && let Some(bound_name) = db.get_session_binding(session_id)?
     {
         // Only hcom writes session bindings, so a row keyed by this session's
-        // own id is trusted identity evidence. Heal bindings created by older
-        // versions before returning the existing row.
-        db.mark_claude_session_validated(session_id, &bound_name)?;
+        // own id is trusted identity evidence. Heal Claude bindings created by
+        // older versions before returning the existing row.
+        if ctx.tool == crate::tool::Tool::Claude {
+            db.mark_claude_session_validated(session_id, &bound_name)?;
+        }
         println!("hcom already started for {bound_name}");
         return Ok(0);
     }
@@ -788,7 +807,7 @@ fn start_bare(
     instance_binding::initialize_instance_in_position_file(
         db,
         &name,
-        claude_session_id.as_deref(),
+        session_id.as_deref(),
         None, // parent_session_id
         None, // parent_name
         None, // agent_id
@@ -802,9 +821,11 @@ fn start_bare(
         None,  // cwd_override
     );
 
-    if let Some(ref session_id) = claude_session_id {
+    if let Some(ref session_id) = session_id {
         db.set_session_binding(session_id, &name)?;
-        db.mark_claude_session_validated(session_id, &name)?;
+        if ctx.tool == crate::tool::Tool::Claude {
+            db.mark_claude_session_validated(session_id, &name)?;
+        }
     }
 
     // Bind process if we have a process_id
@@ -818,10 +839,7 @@ fn start_bare(
     // recognize this session by, so a later `hcom start` here mints another
     // identity. Say what was just created and name the way back instead of
     // letting the duplicate appear silently.
-    if explicit_name.is_none()
-        && ctx.tool == crate::tool::Tool::Claude
-        && claude_session_id.is_none()
-    {
+    if explicit_name.is_none() && ctx.tool == crate::tool::Tool::Claude && session_id.is_none() {
         let candidates = unbound_claude_candidates(db, ctx, &name);
         eprintln!(
             "[hcom] warn: this Claude session exposes no session id, so it was registered \
@@ -905,6 +923,23 @@ mod tests {
         env.insert("CLAUDECODE".to_string(), "1".to_string());
         if let Some((key, value)) = session {
             env.insert(key.to_string(), value.to_string());
+        }
+        HcomContext::from_env(&env, PathBuf::from(cwd))
+    }
+
+    fn make_codex_ctx(thread_id: Option<&str>, cwd: &str) -> HcomContext {
+        let mut env: HashMap<String, String> = std::env::vars().collect();
+        env.remove("HCOM_PROCESS_ID");
+        env.remove("HCOM_LAUNCHED");
+        env.remove("HCOM_PTY_MODE");
+        env.remove("CODEX_SANDBOX");
+        match thread_id {
+            Some(value) => {
+                env.insert("CODEX_THREAD_ID".to_string(), value.to_string());
+            }
+            None => {
+                env.remove("CODEX_THREAD_ID");
+            }
         }
         HcomContext::from_env(&env, PathBuf::from(cwd))
     }
@@ -1093,6 +1128,60 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_codex_session_id_trims_and_rejects_empty_values() {
+        assert_eq!(
+            resolve_codex_session_id(&make_codex_ctx(Some("  thread-1  "), "/tmp/project")),
+            Some("thread-1".to_string())
+        );
+        assert_eq!(
+            resolve_codex_session_id(&make_codex_ctx(Some("   "), "/tmp/project")),
+            None
+        );
+        assert_eq!(
+            resolve_codex_session_id(&make_codex_ctx(None, "/tmp/project")),
+            None
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_bare_codex_start_binds_and_reuses_thread_id() {
+        let (_dir, hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        assert!(crate::hooks::codex::setup_codex_hooks(false));
+        let ctx = make_codex_ctx(Some("thread-bare-codex"), "/tmp/project");
+
+        assert_eq!(start_bare(&db, &hcom_dir, &ctx, None).unwrap(), 0);
+        let name = db
+            .get_session_binding("thread-bare-codex")
+            .unwrap()
+            .expect("the first bare start must bind the Desktop task");
+        let row = db.get_instance_full(&name).unwrap().unwrap();
+        assert_eq!(row.tool, "codex");
+        assert_eq!(row.session_id.as_deref(), Some("thread-bare-codex"));
+
+        assert_eq!(start_bare(&db, &hcom_dir, &ctx, None).unwrap(), 0);
+        assert_eq!(
+            db.get_session_binding("thread-bare-codex")
+                .unwrap()
+                .as_deref(),
+            Some(name.as_str())
+        );
+        let codex_rows: Vec<String> = db
+            .iter_instances_full()
+            .unwrap()
+            .into_iter()
+            .filter(|row| row.tool == "codex")
+            .map(|row| row.name)
+            .collect();
+        assert_eq!(
+            codex_rows,
+            vec![name],
+            "repeat start must not mint a duplicate"
+        );
+    }
+
+    #[test]
     #[serial]
     fn test_vanilla_claude_start_reuses_claude_code_session_id() {
         let (_dir, hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
@@ -1175,6 +1264,48 @@ mod tests {
             Some("nova"),
             "a start after the rebind returns the reclaimed identity"
         );
+    }
+
+    #[test]
+    #[serial]
+    fn test_codex_rebind_uses_thread_id_without_process_binding() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, tool, directory, status, created_at) VALUES (?1, 'codex', ?2, 'active', ?3)",
+                params!["desktop-old", "/tmp/project", crate::shared::time::now_epoch_f64()],
+            )
+            .unwrap();
+        let ctx = make_codex_ctx(Some("thread-desktop"), "/tmp/project");
+
+        assert_eq!(start_rebind(&db, "desktop-old", &ctx, None).unwrap(), 0);
+        let row = db.get_instance_full("desktop-old").unwrap().unwrap();
+        assert_eq!(row.tool, "codex");
+        assert_eq!(row.session_id.as_deref(), Some("thread-desktop"));
+        assert_eq!(
+            db.get_session_binding("thread-desktop").unwrap().as_deref(),
+            Some("desktop-old")
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_codex_rebind_ignores_empty_thread_id() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, tool, directory, status, created_at) VALUES (?1, 'codex', ?2, 'active', ?3)",
+                params!["desktop-empty", "/tmp/project", crate::shared::time::now_epoch_f64()],
+            )
+            .unwrap();
+        let ctx = make_codex_ctx(Some("   "), "/tmp/project");
+
+        assert_eq!(start_rebind(&db, "desktop-empty", &ctx, None).unwrap(), 0);
+        let row = db.get_instance_full("desktop-empty").unwrap().unwrap();
+        assert!(row.session_id.is_none());
+        assert!(db.get_session_binding("").unwrap().is_none());
     }
 
     #[test]

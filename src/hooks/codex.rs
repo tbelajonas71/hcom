@@ -361,23 +361,183 @@ fn set_prompt_active(db: &HcomDb, instance_name: &str) {
     lifecycle::set_status(db, instance_name, ST_ACTIVE, "prompt", Default::default());
 }
 
+fn codex_hook_cwd(ctx: &HcomContext, payload: &HookPayload) -> String {
+    payload
+        .raw
+        .get("cwd")
+        .and_then(|value| value.as_str())
+        .map(str::to_owned)
+        .unwrap_or_else(|| ctx.cwd.to_string_lossy().to_string())
+}
+
+fn codex_restore_paths_match(stopped: &str, current: &str) -> bool {
+    let stopped = std::fs::canonicalize(stopped).unwrap_or_else(|_| PathBuf::from(stopped));
+    let current = std::fs::canonicalize(current).unwrap_or_else(|_| PathBuf::from(current));
+
+    #[cfg(windows)]
+    {
+        stopped
+            .to_string_lossy()
+            .eq_ignore_ascii_case(&current.to_string_lossy())
+    }
+    #[cfg(not(windows))]
+    {
+        stopped == current
+    }
+}
+
+/// Recreate a Codex row that stop/exit cleanup deleted.
+///
+/// `bind_session_to_process` can recover the canonical name from the durable
+/// stopped event without a process binding, but its generic reconstruction
+/// path needs a launch placeholder. Codex Desktop has no such placeholder, so
+/// SessionStart restores the row from the same stopped snapshot after checking
+/// that the tool and working directory still describe this task.
+fn restore_missing_codex_instance(
+    db: &HcomDb,
+    ctx: &HcomContext,
+    payload: &HookPayload,
+    session_id: &str,
+    instance_name: &str,
+) -> bool {
+    if let Some(instance) = db.get_instance_full(instance_name).ok().flatten() {
+        let current_cwd = codex_hook_cwd(ctx, payload);
+        return instance.tool == "codex"
+            && !instances::is_remote_instance(&instance)
+            && (instance.directory.is_empty()
+                || (!current_cwd.is_empty()
+                    && codex_restore_paths_match(&instance.directory, &current_cwd)));
+    }
+
+    let data: String = match db.conn().query_row(
+        "SELECT data FROM events
+         WHERE type = 'life'
+           AND instance = ?1
+           AND json_extract(data, '$.action') = 'stopped'
+           AND json_extract(data, '$.snapshot.session_id') = ?2
+         ORDER BY id DESC LIMIT 1",
+        rusqlite::params![instance_name, session_id],
+        |row| row.get(0),
+    ) {
+        Ok(data) => data,
+        Err(_) => return false,
+    };
+    let data: Value = match serde_json::from_str(&data) {
+        Ok(data) => data,
+        Err(_) => return false,
+    };
+    let Some(snapshot) = data.get("snapshot") else {
+        return false;
+    };
+
+    if snapshot.get("tool").and_then(Value::as_str) != Some("codex")
+        || snapshot
+            .get("origin_device_id")
+            .and_then(Value::as_str)
+            .is_some_and(|device| !device.is_empty())
+    {
+        return false;
+    }
+
+    let current_cwd = codex_hook_cwd(ctx, payload);
+    let stopped_cwd = snapshot
+        .get("directory")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if !stopped_cwd.is_empty()
+        && (current_cwd.is_empty() || !codex_restore_paths_match(stopped_cwd, &current_cwd))
+    {
+        return false;
+    }
+
+    let transcript_path = payload
+        .transcript_path
+        .as_deref()
+        .filter(|path| !path.is_empty())
+        .or_else(|| {
+            snapshot
+                .get("transcript_path")
+                .and_then(Value::as_str)
+                .filter(|path| !path.is_empty())
+        });
+    let directory = if current_cwd.is_empty() {
+        stopped_cwd
+    } else {
+        current_cwd.as_str()
+    };
+
+    if !instance_binding::initialize_instance_in_position_file(
+        db,
+        instance_name,
+        Some(session_id),
+        snapshot.get("parent_session_id").and_then(Value::as_str),
+        snapshot.get("parent_name").and_then(Value::as_str),
+        snapshot.get("agent_id").and_then(Value::as_str),
+        transcript_path,
+        Some("codex"),
+        snapshot
+            .get("background")
+            .and_then(Value::as_i64)
+            .is_some_and(|background| background != 0),
+        snapshot.get("tag").and_then(Value::as_str),
+        snapshot.get("wait_timeout").and_then(Value::as_i64),
+        snapshot.get("subagent_timeout").and_then(Value::as_i64),
+        snapshot.get("hints").and_then(Value::as_str),
+        Some(directory),
+    ) {
+        return false;
+    }
+
+    let mut updates = serde_json::Map::new();
+    if let Some(last_event_id) = snapshot.get("last_event_id").and_then(Value::as_i64) {
+        updates.insert("last_event_id".into(), Value::from(last_event_id));
+    }
+    if let Some(name_announced) = snapshot.get("name_announced").and_then(Value::as_i64) {
+        updates.insert("name_announced".into(), Value::from(name_announced));
+    }
+    let _ = db.update_instance_fields(instance_name, &updates);
+
+    db.get_instance_full(instance_name).ok().flatten().is_some()
+}
+
+fn resolve_sessionstart_instance(
+    db: &HcomDb,
+    ctx: &HcomContext,
+    payload: &HookPayload,
+    session_id: &str,
+) -> Option<String> {
+    // Codex Desktop has no HCOM_PROCESS_ID. SessionStart is the one safe point
+    // to restore an identity removed by stop/exit cleanup: doing this in the
+    // shared resolver would undo an intentional stop on every later hook.
+    if let Some(process_id) = ctx.process_id.as_deref() {
+        return instance_binding::bind_session_to_process(db, session_id, Some(process_id));
+    }
+
+    // A live session binding is already foreign-keyed to an existing row. Check
+    // ownership before accepting it, but do not send Desktop through the generic
+    // stopped-row path: without a launch placeholder that path attempts a rebind
+    // before the row exists and emits the very FK error this recovery prevents.
+    if let Ok(Some(instance_name)) = db.get_session_binding(session_id) {
+        return restore_missing_codex_instance(db, ctx, payload, session_id, &instance_name)
+            .then_some(instance_name);
+    }
+
+    if let Ok(Some(instance_name)) = db.find_stopped_instance_by_session_id(session_id)
+        && restore_missing_codex_instance(db, ctx, payload, session_id, &instance_name)
+    {
+        return Some(instance_name);
+    }
+
+    resolve_codex_instance(db, ctx, payload).map(|instance| instance.name)
+}
+
 fn handle_sessionstart(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) -> HookResult {
     let session_id = match payload.session_id.as_deref() {
         Some(sid) if !sid.is_empty() => sid,
         _ => return hook_noop(),
     };
 
-    let mut instance_name = if let Some(pid) = ctx.process_id.as_deref() {
-        instance_binding::bind_session_to_process(db, session_id, Some(pid))
-    } else {
-        None
-    };
-
-    if instance_name.is_none() {
-        instance_name = resolve_codex_instance(db, ctx, payload).map(|i| i.name);
-    }
-
-    let instance_name = match instance_name {
+    let instance_name = match resolve_sessionstart_instance(db, ctx, payload, session_id) {
         Some(name) => name,
         None => return hook_noop(),
     };
@@ -2665,6 +2825,228 @@ mod tests {
     use super::*;
     use crate::hooks::test_helpers::{EnvGuard, isolated_test_env};
     use serial_test::serial;
+
+    fn codex_test_ctx(thread_id: &str, cwd: &str) -> HcomContext {
+        let mut env = std::env::vars().collect::<HashMap<_, _>>();
+        env.remove("HCOM_PROCESS_ID");
+        env.insert("CODEX_SANDBOX".to_string(), "1".to_string());
+        env.insert("CODEX_THREAD_ID".to_string(), thread_id.to_string());
+        HcomContext::from_env(&env, PathBuf::from(cwd))
+    }
+
+    fn codex_test_payload(event: &str, session_id: &str, cwd: &str) -> HookPayload {
+        HookPayload::from_codex_native(
+            event,
+            serde_json::json!({
+                "session_id": session_id,
+                "cwd": cwd,
+            }),
+        )
+    }
+
+    fn log_codex_stopped_snapshot(
+        db: &HcomDb,
+        name: &str,
+        session_id: &str,
+        tool: &str,
+        cwd: &str,
+        last_event_id: i64,
+    ) {
+        db.log_event(
+            "life",
+            name,
+            &serde_json::json!({
+                "action": "stopped",
+                "snapshot": {
+                    "name": name,
+                    "session_id": session_id,
+                    "tool": tool,
+                    "directory": cwd,
+                    "transcript_path": null,
+                    "parent_name": null,
+                    "parent_session_id": null,
+                    "tag": "desktop",
+                    "wait_timeout": 321,
+                    "subagent_timeout": null,
+                    "hints": "restored",
+                    "background": 0,
+                    "agent_id": null,
+                    "name_announced": 1,
+                    "origin_device_id": null,
+                    "last_event_id": last_event_id
+                }
+            }),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn test_sessionstart_restores_stopped_desktop_without_process_binding() {
+        let (_tmp, _hcom_dir, _home, _guard) = isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        let session_id = "thread-restored";
+        let name = "desktop-restored";
+        let cwd = "/tmp/project";
+
+        instance_binding::initialize_instance_in_position_file(
+            &db,
+            name,
+            Some(session_id),
+            None,
+            None,
+            None,
+            None,
+            Some("codex"),
+            false,
+            Some("desktop"),
+            Some(321),
+            None,
+            Some("restored"),
+            Some(cwd),
+        );
+        db.set_session_binding(session_id, name).unwrap();
+        log_codex_stopped_snapshot(&db, name, session_id, "codex", cwd, 27);
+        db.delete_instance(name).unwrap();
+        assert!(db.get_instance_full(name).unwrap().is_none());
+        assert!(db.get_session_binding(session_id).unwrap().is_none());
+
+        let ctx = codex_test_ctx(session_id, cwd);
+        let payload = codex_test_payload("SessionStart", session_id, cwd);
+        let _ = handle_sessionstart(&db, &ctx, &payload);
+
+        let row = db
+            .get_instance_full(name)
+            .unwrap()
+            .expect("SessionStart must recreate the deleted Desktop row");
+        assert_eq!(row.tool, "codex");
+        assert_eq!(row.directory, cwd);
+        assert_eq!(row.session_id.as_deref(), Some(session_id));
+        assert_eq!(
+            row.last_event_id, 27,
+            "delivery cursor must survive restore"
+        );
+        assert_eq!(row.tag.as_deref(), Some("desktop"));
+        assert_eq!(row.hints.as_deref(), Some("restored"));
+        assert_eq!(row.wait_timeout, Some(321));
+        assert_eq!(
+            db.get_session_binding(session_id).unwrap().as_deref(),
+            Some(name)
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_sessionstart_repairs_missing_binding_for_existing_codex_row() {
+        let (_tmp, _hcom_dir, _home, _guard) = isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        let session_id = "thread-unbound";
+        let name = "desktop-unbound";
+        let cwd = "/tmp/project";
+        instance_binding::initialize_instance_in_position_file(
+            &db,
+            name,
+            Some(session_id),
+            None,
+            None,
+            None,
+            None,
+            Some("codex"),
+            false,
+            None,
+            None,
+            None,
+            None,
+            Some(cwd),
+        );
+        log_codex_stopped_snapshot(&db, name, session_id, "codex", cwd, 0);
+        assert!(db.get_session_binding(session_id).unwrap().is_none());
+
+        let ctx = codex_test_ctx(session_id, cwd);
+        let payload = codex_test_payload("SessionStart", session_id, cwd);
+        let _ = handle_sessionstart(&db, &ctx, &payload);
+
+        assert_eq!(
+            db.get_session_binding(session_id).unwrap().as_deref(),
+            Some(name)
+        );
+        assert!(db.get_instance_full(name).unwrap().is_some());
+    }
+
+    #[test]
+    #[serial]
+    fn test_non_sessionstart_hook_does_not_restore_intentionally_stopped_codex() {
+        let (_tmp, _hcom_dir, _home, _guard) = isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        let session_id = "thread-stopped";
+        let name = "desktop-stopped";
+        let cwd = "/tmp/project";
+        log_codex_stopped_snapshot(&db, name, session_id, "codex", cwd, 0);
+
+        let ctx = codex_test_ctx(session_id, cwd);
+        let payload = codex_test_payload("UserPromptSubmit", session_id, cwd);
+        let _ = handle_userpromptsubmit(&db, &ctx, &payload);
+
+        assert!(db.get_instance_full(name).unwrap().is_none());
+        assert!(db.get_session_binding(session_id).unwrap().is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn test_sessionstart_refuses_incompatible_stopped_snapshot() {
+        let (_tmp, _hcom_dir, _home, _guard) = isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        let cwd = "/tmp/project";
+
+        for (name, session_id, tool, stopped_cwd) in [
+            ("wrong-tool", "thread-wrong-tool", "claude", cwd),
+            (
+                "wrong-directory",
+                "thread-wrong-directory",
+                "codex",
+                "/tmp/other-project",
+            ),
+        ] {
+            log_codex_stopped_snapshot(&db, name, session_id, tool, stopped_cwd, 0);
+            let ctx = codex_test_ctx(session_id, cwd);
+            let payload = codex_test_payload("SessionStart", session_id, cwd);
+            let _ = handle_sessionstart(&db, &ctx, &payload);
+
+            assert!(
+                db.get_instance_full(name).unwrap().is_none(),
+                "incompatible stopped identity {name} must not be recreated"
+            );
+            assert!(db.get_session_binding(session_id).unwrap().is_none());
+        }
+
+        let live_name = "live-wrong-tool";
+        let live_session = "thread-live-wrong-tool";
+        instance_binding::initialize_instance_in_position_file(
+            &db,
+            live_name,
+            Some(live_session),
+            None,
+            None,
+            None,
+            None,
+            Some("claude"),
+            false,
+            None,
+            None,
+            None,
+            None,
+            Some(cwd),
+        );
+        db.set_session_binding(live_session, live_name).unwrap();
+        let ctx = codex_test_ctx(live_session, cwd);
+        let payload = codex_test_payload("SessionStart", live_session, cwd);
+        let _ = handle_sessionstart(&db, &ctx, &payload);
+        assert_eq!(
+            db.get_instance_full(live_name).unwrap().unwrap().tool,
+            "claude",
+            "a live non-Codex binding must not be claimed"
+        );
+    }
 
     #[test]
     fn test_hook_payload_factory_uses_native_fields() {

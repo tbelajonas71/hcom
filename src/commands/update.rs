@@ -138,7 +138,7 @@ mod tests {
 
     #[test]
     fn estate_managed_update_only_blocks_apply() {
-        assert_eq!(update_apply_is_blocked(&UpdateArgs { check: true }), false);
+        assert!(!update_apply_is_blocked(&UpdateArgs { check: true }));
         assert_eq!(
             update_apply_is_blocked(&UpdateArgs { check: false }),
             cfg!(feature = "estate-managed-update")

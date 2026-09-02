@@ -2898,10 +2898,7 @@ fn build_pinned_hook_entry_command(prefix: &[String], cmd_suffix: &str) -> Strin
 /// path valid in Git Bash, which Claude uses for command hooks on Windows.
 #[cfg(windows)]
 fn windows_hook_hcom_prefix() -> Option<Vec<String>> {
-    let exe = std::env::current_exe().ok()?;
-    let resolved = exe.canonicalize().unwrap_or(exe);
-    let resolved = crate::shared::platform::child_process_path(&resolved);
-    Some(vec![resolved.to_string_lossy().replace('\\', "/")])
+    crate::runtime_env::windows_current_hcom_executable().map(|exe| vec![exe])
 }
 
 /// Build a hook command that silently exits 0 when hcom is not installed.

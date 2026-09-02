@@ -46,6 +46,20 @@ pub(crate) fn build_hcom_command() -> String {
     get_hcom_prefix().join(" ")
 }
 
+/// Resolve the exact native hcom executable running on Windows.
+///
+/// Hook installers use this instead of PATH so long-running desktop clients
+/// cannot select an older `hcom.exe` from an inherited environment. The
+/// forward-slash form is accepted by both Git Bash and `cmd.exe`, and avoids
+/// JSON backslash escaping in generated hook declarations.
+#[cfg(windows)]
+pub(crate) fn windows_current_hcom_executable() -> Option<String> {
+    let exe = std::env::current_exe().ok()?;
+    let resolved = exe.canonicalize().unwrap_or(exe);
+    let resolved = crate::shared::platform::child_process_path(&resolved);
+    Some(resolved.to_string_lossy().replace('\\', "/"))
+}
+
 /// Gemini / Antigravity shared config directory (`~/.gemini` or under `GEMINI_CLI_HOME`).
 pub(crate) fn gemini_family_config_dir() -> std::path::PathBuf {
     if let Ok(dir) = std::env::var("GEMINI_CLI_HOME")

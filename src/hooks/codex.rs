@@ -840,7 +840,23 @@ fn hook_state_key_belongs_to_hcom_hooks_json(key: &str, hooks_path: &Path) -> bo
     paths_equivalent(Path::new(key_source), hooks_path)
 }
 
+/// Build a Windows `cmd.exe /C` command with the executable kept as one token.
+///
+/// Double quotes are the native quoting form for Codex's Windows hook runner;
+/// unlike POSIX single quotes, they preserve paths containing spaces under
+/// `cmd.exe`. A double quote cannot occur in a Windows path component.
+#[cfg(windows)]
+fn build_pinned_windows_codex_hook_command(executable: &str, command: &str) -> String {
+    debug_assert!(!executable.contains('"'));
+    format!("\"{executable}\" {command}")
+}
+
 fn build_codex_hook_command(command: &str) -> String {
+    #[cfg(windows)]
+    if let Some(executable) = crate::runtime_env::windows_current_hcom_executable() {
+        return build_pinned_windows_codex_hook_command(&executable, command);
+    }
+
     let mut parts = crate::runtime_env::get_hcom_prefix();
     parts.push(command.to_string());
     parts.join(" ")
@@ -3129,6 +3145,75 @@ mod tests {
     }
 
     // -- settings setup/remove/verify --
+
+    #[test]
+    #[cfg(windows)]
+    fn test_pinned_windows_codex_hook_command_quotes_path_with_spaces() {
+        assert_eq!(
+            build_pinned_windows_codex_hook_command(
+                "C:/Users/Test User/.hcom/bin/hcom.exe",
+                "codex-stop",
+            ),
+            "\"C:/Users/Test User/.hcom/bin/hcom.exe\" codex-stop"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    #[serial]
+    fn test_setup_codex_hooks_pins_current_executable_without_bare_hcom() {
+        let (_tmp, _hcom_dir, _home, _guard) = isolated_test_env();
+        unsafe { std::env::set_var("HCOM_TEST_CODEX_CLI_VERSION", "codex-cli 0.130.0") };
+
+        assert!(setup_codex_hooks(false));
+        let json: Value = serde_json::from_str(
+            &std::fs::read_to_string(get_codex_hooks_path()).expect("read generated hooks"),
+        )
+        .expect("parse generated hooks");
+        let expected_executable = crate::runtime_env::windows_current_hcom_executable()
+            .expect("current executable should resolve");
+        let expected_prefix = format!("\"{expected_executable}\" ");
+
+        for (event, _, _) in CODEX_HOOK_COMMANDS {
+            let groups = json["hooks"][*event]
+                .as_array()
+                .unwrap_or_else(|| panic!("{event} groups missing"));
+            let commands: Vec<&str> = groups
+                .iter()
+                .flat_map(|group| {
+                    group["hooks"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|hook| hook["command"].as_str())
+                })
+                .filter(|command| is_hcom_codex_command(command))
+                .collect();
+            assert_eq!(commands.len(), 1, "{event} generated hook count");
+            assert!(
+                commands[0].starts_with(&expected_prefix),
+                "{event} did not pin current executable: {}",
+                commands[0]
+            );
+            assert!(!commands[0].starts_with("hcom "));
+            assert!(!commands[0].contains("${HCOM"));
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_setup_codex_hooks_reinstall_is_idempotent() {
+        let (_tmp, _hcom_dir, _home, _guard) = isolated_test_env();
+        unsafe { std::env::set_var("HCOM_TEST_CODEX_CLI_VERSION", "codex-cli 0.130.0") };
+
+        assert!(setup_codex_hooks(false));
+        let first = std::fs::read_to_string(get_codex_hooks_path()).unwrap();
+        assert!(setup_codex_hooks(false));
+        let second = std::fs::read_to_string(get_codex_hooks_path()).unwrap();
+
+        assert_eq!(first, second, "Codex hook reinstall changed hooks.json");
+        assert!(verify_codex_hooks_installed(false));
+    }
 
     #[test]
     #[serial]

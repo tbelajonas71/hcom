@@ -54,10 +54,54 @@ pub(crate) fn build_hcom_command() -> String {
 /// JSON backslash escaping in generated hook declarations.
 #[cfg(windows)]
 pub(crate) fn windows_current_hcom_executable() -> Option<String> {
+    use std::os::windows::ffi::OsStrExt;
+
     let exe = std::env::current_exe().ok()?;
     let resolved = exe.canonicalize().unwrap_or(exe);
     let resolved = crate::shared::platform::child_process_path(&resolved);
-    Some(resolved.to_string_lossy().replace('\\', "/"))
+    let command_path = resolved.to_string_lossy();
+    let command_path = if command_path.chars().any(char::is_whitespace) {
+        // Codex 0.145+ wraps the complete Windows hook command in a second
+        // pair of quotes before passing it to cmd.exe. An inner quoted path
+        // therefore arrives as a literal `\\"...\\"` token and exits 1.
+        // Use the DOS short form to keep the command line quote-free. If 8.3
+        // names are disabled, return None so hook setup fails before writing a
+        // declaration that Codex cannot execute.
+        let wide: Vec<u16> = resolved.as_os_str().encode_wide().chain(Some(0)).collect();
+        let mut capacity = 260u32;
+        loop {
+            let mut buffer = vec![0u16; capacity as usize];
+            let length = unsafe {
+                windows_sys::Win32::Storage::FileSystem::GetShortPathNameW(
+                    wide.as_ptr(),
+                    buffer.as_mut_ptr(),
+                    capacity,
+                )
+            };
+            if length == 0 {
+                return None;
+            }
+            if length < capacity {
+                break String::from_utf16(&buffer[..length as usize]).ok()?;
+            }
+            capacity = length.saturating_add(1);
+            if capacity > 32768 {
+                return None;
+            }
+        }
+    } else {
+        command_path.into_owned()
+    };
+
+    // These characters have cmd.exe meaning even without quoting. Reject
+    // them rather than generating a hook that can execute a different command.
+    if command_path
+        .chars()
+        .any(|ch| ch.is_whitespace() || matches!(ch, '"' | '&' | '|' | '<' | '>' | '^' | '%' | '!'))
+    {
+        return None;
+    }
+    Some(command_path.replace('\\', "/"))
 }
 
 /// Gemini / Antigravity shared config directory (`~/.gemini` or under `GEMINI_CLI_HOME`).

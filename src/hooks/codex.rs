@@ -32,6 +32,80 @@ use crate::shared::{ST_ACTIVE, ST_LISTENING};
 use super::common::SAFE_HCOM_COMMANDS;
 
 const HCOM_TRIGGER: &str = "<hcom>";
+const CODEX_DIRECTORY_PIN_KEY: &str = "codex_directory_pin_v1";
+const CODEX_DIRECTORY_PIN_SOURCE: &str = "explicit-start-relocate-v1";
+
+pub(crate) fn directory_override_launch_context(directory: &str, session_id: &str) -> String {
+    serde_json::json!({
+        CODEX_DIRECTORY_PIN_KEY: {
+            "directory": directory,
+            "session_id": session_id,
+            "source": CODEX_DIRECTORY_PIN_SOURCE,
+        }
+    })
+    .to_string()
+}
+
+fn pinned_directory_from_value(value: &Value, session_id: &str) -> Option<String> {
+    let pin = value.as_object()?;
+    let directory = pin.get("directory")?.as_str()?.trim();
+    let pinned_session = pin.get("session_id")?.as_str()?.trim();
+    let source = pin.get("source")?.as_str()?;
+    if directory.is_empty()
+        || !Path::new(directory).is_absolute()
+        || session_id.is_empty()
+        || pinned_session != session_id
+        || source != CODEX_DIRECTORY_PIN_SOURCE
+    {
+        return None;
+    }
+    Some(directory.to_string())
+}
+
+fn pinned_directory_is_live(directory: &str) -> bool {
+    std::fs::symlink_metadata(directory)
+        .ok()
+        .is_some_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
+}
+
+fn launch_context_has_directory_pin(launch_context: Option<&str>) -> bool {
+    launch_context
+        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+        .is_some_and(|context| context.get(CODEX_DIRECTORY_PIN_KEY).is_some())
+}
+
+pub(crate) fn pinned_directory_from_launch_context(
+    launch_context: Option<&str>,
+    session_id: &str,
+) -> Option<String> {
+    let context: Value = serde_json::from_str(launch_context?).ok()?;
+    pinned_directory_from_value(context.get(CODEX_DIRECTORY_PIN_KEY)?, session_id)
+}
+
+fn pinned_directory_from_snapshot(snapshot: &Value, session_id: &str) -> Option<String> {
+    pinned_directory_from_value(snapshot.get(CODEX_DIRECTORY_PIN_KEY)?, session_id)
+}
+
+pub(crate) fn directory_override_snapshot_value(
+    launch_context: Option<&str>,
+    session_id: Option<&str>,
+) -> Value {
+    let Some(session_id) = session_id.filter(|value| !value.is_empty()) else {
+        return Value::Null;
+    };
+    let Some(context) = launch_context.and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+    else {
+        return Value::Null;
+    };
+    let Some(pin) = context.get(CODEX_DIRECTORY_PIN_KEY) else {
+        return Value::Null;
+    };
+    if pinned_directory_from_value(pin, session_id).is_none() {
+        return Value::Null;
+    }
+    pin.clone()
+}
+
 const CODEX_HOOK_COMMANDS: &[(&str, &str, Option<&str>)] = &[
     (
         "SessionStart",
@@ -305,13 +379,43 @@ fn update_codex_position(
     instance_name: &str,
 ) {
     let mut updates = serde_json::Map::new();
-    let cwd = payload
-        .raw
-        .get("cwd")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| ctx.cwd.to_string_lossy().to_string());
-    if !cwd.is_empty() {
+    let session_id = payload.session_id.as_deref().unwrap_or("");
+    let launch_context = db
+        .get_instance_full(instance_name)
+        .ok()
+        .flatten()
+        .and_then(|row| row.launch_context);
+    let pin_present = launch_context_has_directory_pin(launch_context.as_deref());
+    let pinned_directory =
+        pinned_directory_from_launch_context(launch_context.as_deref(), session_id);
+    let cwd = match pinned_directory {
+        Some(pinned) if pinned_directory_is_live(&pinned) => Some(pinned),
+        Some(_) => {
+            log::log_warn(
+                "hooks",
+                "codex.directory_pin_invalid",
+                &format!("instance={instance_name} session={session_id} directory_mutated=false"),
+            );
+            None
+        }
+        None if pin_present => {
+            log::log_warn(
+                "hooks",
+                "codex.directory_pin_invalid",
+                &format!("instance={instance_name} session={session_id} directory_mutated=false"),
+            );
+            None
+        }
+        None => Some(
+            payload
+                .raw
+                .get("cwd")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| ctx.cwd.to_string_lossy().to_string()),
+        ),
+    };
+    if let Some(cwd) = cwd.filter(|cwd| !cwd.is_empty()) {
         updates.insert("directory".into(), Value::String(cwd));
     }
     if let Some(session_id) = payload.session_id.as_ref().filter(|s| !s.is_empty()) {
@@ -370,6 +474,38 @@ fn codex_hook_cwd(ctx: &HcomContext, payload: &HookPayload) -> String {
         .unwrap_or_else(|| ctx.cwd.to_string_lossy().to_string())
 }
 
+/// Accept a native Codex lifecycle payload only when the task identity exposed
+/// to the hook process agrees with the payload. The payload session id is the
+/// single canonical identity used by SessionStart after this check; ambient
+/// CLI environment alone never authorizes a registration move.
+fn canonical_sessionstart_id<'a>(ctx: &HcomContext, payload: &'a HookPayload) -> Option<&'a str> {
+    let payload_id = payload.session_id.as_deref()?.trim();
+    let context_id = ctx.codex_thread_id.as_deref()?.trim();
+    let session_env = ctx
+        .raw_env
+        .get("CODEX_SESSION_ID")
+        .map(String::as_str)
+        .map(str::trim)
+        .unwrap_or("");
+    if payload_id.is_empty()
+        || context_id.is_empty()
+        || session_env.is_empty()
+        || payload_id != context_id
+        || payload_id != session_env
+    {
+        log::log_warn(
+            "hooks",
+            "codex.sessionstart_identity_mismatch",
+            &format!(
+                "payload_session_id={} context_thread_id={} context_session_id={} mutated=false",
+                payload_id, context_id, session_env
+            ),
+        );
+        return None;
+    }
+    Some(payload_id)
+}
+
 fn codex_restore_paths_match(stopped: &str, current: &str) -> bool {
     let stopped = std::fs::canonicalize(stopped).unwrap_or_else(|_| PathBuf::from(stopped));
     let current = std::fs::canonicalize(current).unwrap_or_else(|_| PathBuf::from(current));
@@ -386,13 +522,15 @@ fn codex_restore_paths_match(stopped: &str, current: &str) -> bool {
     }
 }
 
-/// Recreate a Codex row that stop/exit cleanup deleted.
+/// Recreate a Codex row that stop/exit cleanup deleted at native SessionStart.
 ///
 /// `bind_session_to_process` can recover the canonical name from the durable
 /// stopped event without a process binding, but its generic reconstruction
 /// path needs a launch placeholder. Codex Desktop has no such placeholder, so
 /// SessionStart restores the row from the same stopped snapshot after checking
-/// that the tool and working directory still describe this task.
+/// that the tool and exact stopped session still describe this task. An
+/// explicit, session-scoped directory pin can preserve a deliberate logical
+/// project relocation; unpinned tasks keep the same-directory guard.
 fn restore_missing_codex_instance(
     db: &HcomDb,
     ctx: &HcomContext,
@@ -402,11 +540,25 @@ fn restore_missing_codex_instance(
 ) -> bool {
     if let Some(instance) = db.get_instance_full(instance_name).ok().flatten() {
         let current_cwd = codex_hook_cwd(ctx, payload);
+        let pin_present = launch_context_has_directory_pin(instance.launch_context.as_deref());
+        let pinned_directory =
+            pinned_directory_from_launch_context(instance.launch_context.as_deref(), session_id);
+        let directory_matches = match pinned_directory {
+            Some(ref pinned) if pinned_directory_is_live(pinned) => {
+                codex_restore_paths_match(&instance.directory, pinned)
+            }
+            Some(_) => false,
+            None if pin_present => false,
+            None => {
+                instance.directory.is_empty()
+                    || (!current_cwd.is_empty()
+                        && codex_restore_paths_match(&instance.directory, &current_cwd))
+            }
+        };
         return instance.tool == "codex"
             && !instances::is_remote_instance(&instance)
-            && (instance.directory.is_empty()
-                || (!current_cwd.is_empty()
-                    && codex_restore_paths_match(&instance.directory, &current_cwd)));
+            && instance.session_id.as_deref() == Some(session_id)
+            && directory_matches;
     }
 
     let data: String = match db.conn().query_row(
@@ -414,9 +566,8 @@ fn restore_missing_codex_instance(
          WHERE type = 'life'
            AND instance = ?1
            AND json_extract(data, '$.action') = 'stopped'
-           AND json_extract(data, '$.snapshot.session_id') = ?2
          ORDER BY id DESC LIMIT 1",
-        rusqlite::params![instance_name, session_id],
+        rusqlite::params![instance_name],
         |row| row.get(0),
     ) {
         Ok(data) => data,
@@ -431,6 +582,7 @@ fn restore_missing_codex_instance(
     };
 
     if snapshot.get("tool").and_then(Value::as_str) != Some("codex")
+        || snapshot.get("session_id").and_then(Value::as_str) != Some(session_id)
         || snapshot
             .get("origin_device_id")
             .and_then(Value::as_str)
@@ -444,11 +596,26 @@ fn restore_missing_codex_instance(
         .get("directory")
         .and_then(Value::as_str)
         .unwrap_or("");
-    if !stopped_cwd.is_empty()
-        && (current_cwd.is_empty() || !codex_restore_paths_match(stopped_cwd, &current_cwd))
-    {
-        return false;
-    }
+    let pin_present = snapshot.get(CODEX_DIRECTORY_PIN_KEY).is_some();
+    let pinned_directory = pinned_directory_from_snapshot(snapshot, session_id);
+    let directory = match pinned_directory.as_deref() {
+        Some(pinned)
+            if pinned_directory_is_live(pinned)
+                && !stopped_cwd.is_empty()
+                && codex_restore_paths_match(stopped_cwd, pinned) =>
+        {
+            pinned
+        }
+        Some(_) => return false,
+        None if pin_present => return false,
+        None if !stopped_cwd.is_empty()
+            && !current_cwd.is_empty()
+            && codex_restore_paths_match(stopped_cwd, &current_cwd) =>
+        {
+            current_cwd.as_str()
+        }
+        None => return false,
+    };
 
     let transcript_path = payload
         .transcript_path
@@ -460,12 +627,6 @@ fn restore_missing_codex_instance(
                 .and_then(Value::as_str)
                 .filter(|path| !path.is_empty())
         });
-    let directory = if current_cwd.is_empty() {
-        stopped_cwd
-    } else {
-        current_cwd.as_str()
-    };
-
     if !instance_binding::initialize_instance_in_position_file(
         db,
         instance_name,
@@ -486,6 +647,14 @@ fn restore_missing_codex_instance(
         Some(directory),
     ) {
         return false;
+    }
+
+    if let Some(pinned) = pinned_directory {
+        let context = directory_override_launch_context(&pinned, session_id);
+        if db.store_launch_context(instance_name, &context).is_err() {
+            let _ = db.delete_instance(instance_name);
+            return false;
+        }
     }
 
     let mut updates = serde_json::Map::new();
@@ -532,9 +701,8 @@ fn resolve_sessionstart_instance(
 }
 
 fn handle_sessionstart(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) -> HookResult {
-    let session_id = match payload.session_id.as_deref() {
-        Some(sid) if !sid.is_empty() => sid,
-        _ => return hook_noop(),
+    let Some(session_id) = canonical_sessionstart_id(ctx, payload) else {
+        return hook_noop();
     };
 
     let instance_name = match resolve_sessionstart_instance(db, ctx, payload, session_id) {
@@ -2863,6 +3031,7 @@ mod tests {
         env.remove("HCOM_PROCESS_ID");
         env.insert("CODEX_SANDBOX".to_string(), "1".to_string());
         env.insert("CODEX_THREAD_ID".to_string(), thread_id.to_string());
+        env.insert("CODEX_SESSION_ID".to_string(), thread_id.to_string());
         HcomContext::from_env(&env, PathBuf::from(cwd))
     }
 
@@ -2969,6 +3138,303 @@ mod tests {
 
     #[test]
     #[serial]
+    fn test_sessionstart_refuses_unpinned_cross_directory_restore() {
+        let (_tmp, _hcom_dir, _home, _guard) = isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        let session_id = "thread-relocated";
+        let name = "cultivation";
+        let old_cwd = "/tmp/old-cultivation-project";
+        let new_cwd = "/tmp/cultivation";
+
+        log_codex_stopped_snapshot(&db, name, session_id, "codex", old_cwd, 81);
+        let ctx = codex_test_ctx(session_id, new_cwd);
+        let payload = codex_test_payload("SessionStart", session_id, new_cwd);
+        let _ = handle_sessionstart(&db, &ctx, &payload);
+
+        assert!(db.get_instance_full(name).unwrap().is_none());
+        assert!(db.get_session_binding(session_id).unwrap().is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn test_sessionstart_restores_pinned_directory_despite_native_cwd() {
+        let (tmp, _hcom_dir, _home, _guard) = isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        let session_id = "thread-pinned";
+        let name = "cultivation";
+        let native_cwd = tmp.path().join("old-scaffold");
+        let pinned_cwd = tmp.path().join("cultivation");
+        std::fs::create_dir_all(&native_cwd).unwrap();
+        std::fs::create_dir_all(&pinned_cwd).unwrap();
+        let native_cwd = native_cwd.to_string_lossy().to_string();
+        let pinned_cwd = pinned_cwd.to_string_lossy().to_string();
+        let pin_context = directory_override_launch_context(&pinned_cwd, session_id);
+        let pin_value: Value = serde_json::from_str(&pin_context).unwrap();
+
+        db.log_event(
+            "life",
+            name,
+            &serde_json::json!({
+                "action": "stopped",
+                "snapshot": {
+                    "name": name,
+                    "session_id": session_id,
+                    "tool": "codex",
+                    "directory": pinned_cwd,
+                    "transcript_path": null,
+                    "parent_name": null,
+                    "parent_session_id": null,
+                    "tag": "desktop",
+                    "wait_timeout": 321,
+                    "subagent_timeout": null,
+                    "hints": "restored",
+                    "background": 0,
+                    "agent_id": null,
+                    "name_announced": 1,
+                    "origin_device_id": null,
+                    "last_event_id": 81,
+                    "codex_directory_pin_v1": pin_value[CODEX_DIRECTORY_PIN_KEY].clone()
+                }
+            }),
+        )
+        .unwrap();
+
+        let ctx = codex_test_ctx(session_id, &native_cwd);
+        let payload = codex_test_payload("SessionStart", session_id, &native_cwd);
+        let _ = handle_sessionstart(&db, &ctx, &payload);
+
+        let row = db
+            .get_instance_full(name)
+            .unwrap()
+            .expect("a valid stopped pin must restore the logical directory");
+        assert_eq!(row.directory, pinned_cwd);
+        assert_eq!(row.session_id.as_deref(), Some(session_id));
+        assert_eq!(row.last_event_id, 81);
+        assert_eq!(
+            pinned_directory_from_launch_context(row.launch_context.as_deref(), session_id)
+                .as_deref(),
+            Some(pinned_cwd.as_str())
+        );
+
+        let later = codex_test_payload("UserPromptSubmit", session_id, &native_cwd);
+        let _ = handle_userpromptsubmit(&db, &ctx, &later);
+        assert_eq!(
+            db.get_instance_full(name).unwrap().unwrap().directory,
+            pinned_cwd,
+            "ordinary hooks must not overwrite the logical directory pin"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_directory_pin_survives_real_stop_and_sessionstart_cycle() {
+        let (tmp, _hcom_dir, _home, _guard) = isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        let session_id = "thread-pin-cycle";
+        let name = "cultivation";
+        let native_cwd = tmp.path().join("old-scaffold");
+        let pinned_cwd = tmp.path().join("cultivation");
+        std::fs::create_dir_all(&native_cwd).unwrap();
+        std::fs::create_dir_all(&pinned_cwd).unwrap();
+        let native_cwd = native_cwd.to_string_lossy().to_string();
+        let pinned_cwd = pinned_cwd.to_string_lossy().to_string();
+
+        assert!(instance_binding::initialize_instance_in_position_file(
+            &db,
+            name,
+            Some(session_id),
+            None,
+            None,
+            None,
+            None,
+            Some("codex"),
+            false,
+            Some("desktop"),
+            Some(321),
+            None,
+            Some("relocated"),
+            Some(&pinned_cwd),
+        ));
+        db.store_launch_context(
+            name,
+            &directory_override_launch_context(&pinned_cwd, session_id),
+        )
+        .unwrap();
+        db.set_session_binding(session_id, name).unwrap();
+
+        common::stop_instance(&db, name, "test", "pin-cycle");
+        assert!(db.get_instance_full(name).unwrap().is_none());
+
+        let ctx = codex_test_ctx(session_id, &native_cwd);
+        let payload = codex_test_payload("SessionStart", session_id, &native_cwd);
+        let _ = handle_sessionstart(&db, &ctx, &payload);
+
+        let row = db.get_instance_full(name).unwrap().unwrap();
+        assert_eq!(row.directory, pinned_cwd);
+        assert_eq!(row.session_id.as_deref(), Some(session_id));
+        assert_eq!(
+            pinned_directory_from_launch_context(row.launch_context.as_deref(), session_id)
+                .as_deref(),
+            Some(pinned_cwd.as_str())
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_sessionstart_refuses_older_pinned_snapshot_after_newer_owner_stop() {
+        let (tmp, _hcom_dir, _home, _guard) = isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        let name = "cultivation";
+        let old_session = "thread-old-owner";
+        let new_session = "thread-new-owner";
+        let native_cwd = tmp.path().join("old-scaffold");
+        let pinned_cwd = tmp.path().join("cultivation");
+        let newer_cwd = tmp.path().join("new-owner");
+        std::fs::create_dir_all(&native_cwd).unwrap();
+        std::fs::create_dir_all(&pinned_cwd).unwrap();
+        std::fs::create_dir_all(&newer_cwd).unwrap();
+        let native_cwd = native_cwd.to_string_lossy().to_string();
+        let pinned_cwd = pinned_cwd.to_string_lossy().to_string();
+        let newer_cwd = newer_cwd.to_string_lossy().to_string();
+        let pin_context = directory_override_launch_context(&pinned_cwd, old_session);
+        let pin_value: Value = serde_json::from_str(&pin_context).unwrap();
+
+        db.log_event(
+            "life",
+            name,
+            &serde_json::json!({
+                "action": "stopped",
+                "snapshot": {
+                    "session_id": old_session,
+                    "tool": "codex",
+                    "directory": pinned_cwd,
+                    "origin_device_id": null,
+                    "last_event_id": 10,
+                    "codex_directory_pin_v1": pin_value[CODEX_DIRECTORY_PIN_KEY].clone()
+                }
+            }),
+        )
+        .unwrap();
+        db.log_event(
+            "life",
+            name,
+            &serde_json::json!({
+                "action": "stopped",
+                "snapshot": {
+                    "session_id": new_session,
+                    "tool": "codex",
+                    "directory": newer_cwd,
+                    "origin_device_id": null,
+                    "last_event_id": 11
+                }
+            }),
+        )
+        .unwrap();
+
+        let ctx = codex_test_ctx(old_session, &native_cwd);
+        let payload = codex_test_payload("SessionStart", old_session, &native_cwd);
+        let _ = handle_sessionstart(&db, &ctx, &payload);
+
+        assert!(db.get_instance_full(name).unwrap().is_none());
+        assert!(db.get_session_binding(old_session).unwrap().is_none());
+        assert!(db.get_session_binding(new_session).unwrap().is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn test_sessionstart_refuses_pin_whose_directory_is_missing_or_file() {
+        let (tmp, _hcom_dir, _home, _guard) = isolated_test_env();
+        let db = HcomDb::open().unwrap();
+
+        for (index, replacement_is_file) in [false, true].into_iter().enumerate() {
+            let name = format!("cultivation-{index}");
+            let session_id = format!("thread-dead-pin-{index}");
+            let native_cwd = tmp.path().join(format!("native-{index}"));
+            let pinned_cwd = tmp.path().join(format!("pin-{index}"));
+            std::fs::create_dir_all(&native_cwd).unwrap();
+            std::fs::create_dir_all(&pinned_cwd).unwrap();
+            let native_cwd = native_cwd.to_string_lossy().to_string();
+            let pinned_cwd = pinned_cwd.to_string_lossy().to_string();
+            let pin_context = directory_override_launch_context(&pinned_cwd, &session_id);
+            let pin_value: Value = serde_json::from_str(&pin_context).unwrap();
+            db.log_event(
+                "life",
+                &name,
+                &serde_json::json!({
+                    "action": "stopped",
+                    "snapshot": {
+                        "session_id": session_id,
+                        "tool": "codex",
+                        "directory": pinned_cwd,
+                        "origin_device_id": null,
+                        "last_event_id": 12,
+                        "codex_directory_pin_v1": pin_value[CODEX_DIRECTORY_PIN_KEY].clone()
+                    }
+                }),
+            )
+            .unwrap();
+            std::fs::remove_dir(&pinned_cwd).unwrap();
+            if replacement_is_file {
+                std::fs::write(&pinned_cwd, b"not a directory").unwrap();
+            }
+
+            let ctx = codex_test_ctx(&session_id, &native_cwd);
+            let payload = codex_test_payload("SessionStart", &session_id, &native_cwd);
+            let _ = handle_sessionstart(&db, &ctx, &payload);
+
+            assert!(db.get_instance_full(&name).unwrap().is_none());
+            assert!(db.get_session_binding(&session_id).unwrap().is_none());
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_sessionstart_refuses_missing_or_mismatched_context_identity() {
+        let (_tmp, _hcom_dir, _home, _guard) = isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        let session_id = "thread-owned";
+        let name = "cultivation";
+        let cwd = "/tmp/cultivation";
+        log_codex_stopped_snapshot(&db, name, session_id, "codex", "/tmp/old", 0);
+
+        let missing_ctx = codex_test_ctx("", cwd);
+        let payload = codex_test_payload("SessionStart", session_id, cwd);
+        let _ = handle_sessionstart(&db, &missing_ctx, &payload);
+        assert!(db.get_instance_full(name).unwrap().is_none());
+
+        let mismatched_ctx = codex_test_ctx("thread-foreign", cwd);
+        let _ = handle_sessionstart(&db, &mismatched_ctx, &payload);
+        assert!(db.get_instance_full(name).unwrap().is_none());
+
+        let mut mismatched_session_env = codex_test_ctx(session_id, cwd);
+        mismatched_session_env
+            .raw_env
+            .insert("CODEX_SESSION_ID".into(), "thread-foreign".into());
+        let _ = handle_sessionstart(&db, &mismatched_session_env, &payload);
+        assert!(db.get_instance_full(name).unwrap().is_none());
+        assert!(db.get_session_binding(session_id).unwrap().is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn test_sessionstart_refuses_wrong_snapshot_session() {
+        let (_tmp, _hcom_dir, _home, _guard) = isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        let name = "cultivation";
+        let cwd = "/tmp/cultivation";
+        log_codex_stopped_snapshot(&db, name, "thread-original", "codex", "/tmp/old", 0);
+
+        let ctx = codex_test_ctx("thread-other", cwd);
+        let payload = codex_test_payload("SessionStart", "thread-other", cwd);
+        let _ = handle_sessionstart(&db, &ctx, &payload);
+
+        assert!(db.get_instance_full(name).unwrap().is_none());
+        assert!(db.get_session_binding("thread-original").unwrap().is_none());
+        assert!(db.get_session_binding("thread-other").unwrap().is_none());
+    }
+
+    #[test]
+    #[serial]
     fn test_sessionstart_repairs_missing_binding_for_existing_codex_row() {
         let (_tmp, _hcom_dir, _home, _guard) = isolated_test_env();
         let db = HcomDb::open().unwrap();
@@ -3030,26 +3496,18 @@ mod tests {
         let db = HcomDb::open().unwrap();
         let cwd = "/tmp/project";
 
-        for (name, session_id, tool, stopped_cwd) in [
-            ("wrong-tool", "thread-wrong-tool", "claude", cwd),
-            (
-                "wrong-directory",
-                "thread-wrong-directory",
-                "codex",
-                "/tmp/other-project",
-            ),
-        ] {
-            log_codex_stopped_snapshot(&db, name, session_id, tool, stopped_cwd, 0);
-            let ctx = codex_test_ctx(session_id, cwd);
-            let payload = codex_test_payload("SessionStart", session_id, cwd);
-            let _ = handle_sessionstart(&db, &ctx, &payload);
+        let name = "wrong-tool";
+        let session_id = "thread-wrong-tool";
+        log_codex_stopped_snapshot(&db, name, session_id, "claude", cwd, 0);
+        let ctx = codex_test_ctx(session_id, cwd);
+        let payload = codex_test_payload("SessionStart", session_id, cwd);
+        let _ = handle_sessionstart(&db, &ctx, &payload);
 
-            assert!(
-                db.get_instance_full(name).unwrap().is_none(),
-                "incompatible stopped identity {name} must not be recreated"
-            );
-            assert!(db.get_session_binding(session_id).unwrap().is_none());
-        }
+        assert!(
+            db.get_instance_full(name).unwrap().is_none(),
+            "incompatible stopped identity {name} must not be recreated"
+        );
+        assert!(db.get_session_binding(session_id).unwrap().is_none());
 
         let live_name = "live-wrong-tool";
         let live_session = "thread-live-wrong-tool";
@@ -3078,6 +3536,33 @@ mod tests {
             "claude",
             "a live non-Codex binding must not be claimed"
         );
+
+        let live_codex_name = "live-wrong-directory";
+        let live_codex_session = "thread-live-wrong-directory";
+        instance_binding::initialize_instance_in_position_file(
+            &db,
+            live_codex_name,
+            Some(live_codex_session),
+            None,
+            None,
+            None,
+            None,
+            Some("codex"),
+            false,
+            None,
+            None,
+            None,
+            None,
+            Some("/tmp/other-project"),
+        );
+        db.set_session_binding(live_codex_session, live_codex_name)
+            .unwrap();
+        let ctx = codex_test_ctx(live_codex_session, cwd);
+        let payload = codex_test_payload("SessionStart", live_codex_session, cwd);
+        let _ = handle_sessionstart(&db, &ctx, &payload);
+        let row = db.get_instance_full(live_codex_name).unwrap().unwrap();
+        assert_eq!(row.directory, "/tmp/other-project");
+        assert_eq!(row.session_id.as_deref(), Some(live_codex_session));
     }
 
     #[test]

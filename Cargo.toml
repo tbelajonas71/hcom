@@ -9,6 +9,12 @@ homepage = "https://github.com/aannoo/hcom"
 repository = "https://github.com/aannoo/hcom"
 rust-version = "1.88"
 
+[features]
+# Distribution builds used by an estate-managed installation must not replace
+# themselves from the public `latest` installer.  The read-only `--check`
+# path remains available; the estate updater owns applying approved builds.
+estate-managed-update = []
+
 [[bin]]
 name = "hcom"
 path = "src/main.rs"

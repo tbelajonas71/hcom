@@ -611,6 +611,10 @@ const UPDATE_HELP: &[HelpEntry] = &[
     ("", "  uv tool install → uv tool upgrade hcom"),
     ("", "  pip install     → pip install -U hcom"),
     ("", "  curl installer  → re-run hcom-installer.sh"),
+    (
+        "",
+        "Estate-managed builds keep --check read-only; approved builds are applied by the estate updater.",
+    ),
 ];
 
 const HOOKS_HELP: &[HelpEntry] = &[

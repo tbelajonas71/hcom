@@ -24,9 +24,23 @@ fn print_dev_root_notice(db: &HcomDb) {
     }
 }
 
+const ESTATE_MANAGED_UPDATE_MESSAGE: &str = "This HCOM build is estate-managed; updates are disabled here. Use the estate-controlled updater to apply an approved, verified build.";
+
+/// Return whether this binary may apply a self-update.  Estate-managed builds
+/// still perform `--check` below so operators can inspect upstream status, but
+/// they fail closed before invoking any installer or package manager.
+fn update_apply_is_blocked(args: &UpdateArgs) -> bool {
+    cfg!(feature = "estate-managed-update") && !args.check
+}
+
 pub fn cmd_update(_db: &HcomDb, args: &UpdateArgs, _ctx: Option<&CommandContext>) -> i32 {
     println!("Checking for updates...");
     print_dev_root_notice(_db);
+
+    if update_apply_is_blocked(args) {
+        eprintln!("{ESTATE_MANAGED_UPDATE_MESSAGE}");
+        return 1;
+    }
 
     let info = match crate::update::fetch_update_info() {
         Ok(i) => i,
@@ -120,6 +134,15 @@ mod tests {
     fn update_args_check_flag() {
         let args = UpdateArgs::try_parse_from(["update", "--check"]).unwrap();
         assert!(args.check);
+    }
+
+    #[test]
+    fn estate_managed_update_only_blocks_apply() {
+        assert_eq!(update_apply_is_blocked(&UpdateArgs { check: true }), false);
+        assert_eq!(
+            update_apply_is_blocked(&UpdateArgs { check: false }),
+            cfg!(feature = "estate-managed-update")
+        );
     }
 
     #[test]

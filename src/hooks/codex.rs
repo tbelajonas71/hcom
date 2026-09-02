@@ -840,15 +840,20 @@ fn hook_state_key_belongs_to_hcom_hooks_json(key: &str, hooks_path: &Path) -> bo
     paths_equivalent(Path::new(key_source), hooks_path)
 }
 
-/// Build a Windows `cmd.exe /C` command with the executable kept as one token.
+/// Build a quote-free Windows hook command.
 ///
-/// Double quotes are the native quoting form for Codex's Windows hook runner;
-/// unlike POSIX single quotes, they preserve paths containing spaces under
-/// `cmd.exe`. A double quote cannot occur in a Windows path component.
+/// Codex wraps the complete command in outer quotes before passing it to
+/// `cmd.exe /C`; embedding quotes around the executable makes the resulting
+/// token literal `\\"...\\"` and exits 1. `windows_current_hcom_executable`
+/// has already converted spaced paths to a safe DOS short path and rejected
+/// cmd metacharacters.
 #[cfg(windows)]
 fn build_pinned_windows_codex_hook_command(executable: &str, command: &str) -> String {
-    debug_assert!(!executable.contains('"'));
-    format!("\"{executable}\" {command}")
+    debug_assert!(
+        executable.chars().all(|ch| !ch.is_whitespace()
+            && !matches!(ch, '"' | '&' | '|' | '<' | '>' | '^' | '%' | '!'))
+    );
+    format!("{executable} {command}")
 }
 
 fn build_codex_hook_command(command: &str) -> String {
@@ -2611,6 +2616,10 @@ pub enum VerifyFailReason {
 
 #[derive(Debug, thiserror::Error)]
 pub enum SetupError {
+    #[error(
+        "cannot create a quote-free Codex Windows hook command for the current hcom executable (path contains spaces or cmd metacharacters and has no usable short form): {path}"
+    )]
+    HookExecutableUnavailable { path: PathBuf },
     #[error("failed to enable Codex experimental hooks feature in {}: {reason}", path.display())]
     EnsureFeatureFailed { path: PathBuf, reason: String },
     #[error("failed to read existing {}: {source}", path.display())]
@@ -2646,6 +2655,13 @@ pub enum SetupError {
 }
 
 pub fn try_setup_codex_hooks(include_permissions: bool) -> Result<(), SetupError> {
+    #[cfg(windows)]
+    if crate::runtime_env::windows_current_hcom_executable().is_none() {
+        return Err(SetupError::HookExecutableUnavailable {
+            path: std::env::current_exe().unwrap_or_else(|_| PathBuf::from("<unknown>")),
+        });
+    }
+
     let config_path = get_codex_config_path();
     let hooks_path = get_codex_hooks_path();
     let feature_key = detect_codex_hooks_feature_key();
@@ -3148,13 +3164,13 @@ mod tests {
 
     #[test]
     #[cfg(windows)]
-    fn test_pinned_windows_codex_hook_command_quotes_path_with_spaces() {
+    fn test_pinned_windows_codex_hook_command_is_quote_free() {
         assert_eq!(
             build_pinned_windows_codex_hook_command(
-                "C:/Users/Test User/.hcom/bin/hcom.exe",
+                "C:/Users/TestUser/.hcom/bin/hcom.exe",
                 "codex-stop",
             ),
-            "\"C:/Users/Test User/.hcom/bin/hcom.exe\" codex-stop"
+            "C:/Users/TestUser/.hcom/bin/hcom.exe codex-stop"
         );
     }
 
@@ -3172,7 +3188,7 @@ mod tests {
         .expect("parse generated hooks");
         let expected_executable = crate::runtime_env::windows_current_hcom_executable()
             .expect("current executable should resolve");
-        let expected_prefix = format!("\"{expected_executable}\" ");
+        let expected_prefix = format!("{expected_executable} ");
 
         for (event, _, _) in CODEX_HOOK_COMMANDS {
             let groups = json["hooks"][*event]
@@ -3197,6 +3213,7 @@ mod tests {
             );
             assert!(!commands[0].starts_with("hcom "));
             assert!(!commands[0].contains("${HCOM"));
+            assert!(!commands[0].contains('"'));
         }
     }
 

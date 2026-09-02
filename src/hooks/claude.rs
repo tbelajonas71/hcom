@@ -2866,6 +2866,7 @@ pub fn load_claude_settings(settings_path: &Path) -> Option<Value> {
 }
 
 /// Quote one argument for the POSIX shell Claude uses to execute hooks.
+#[cfg(any(windows, test))]
 fn quote_posix_arg(arg: &str) -> String {
     format!("'{}'", arg.replace('\'', "'\"'\"'"))
 }
@@ -2874,6 +2875,7 @@ fn quote_posix_arg(arg: &str) -> String {
 ///
 /// `set --` plus `exec "$@"` preserves every argument boundary, including a
 /// native Windows executable path containing spaces or apostrophes.
+#[cfg(any(windows, test))]
 fn build_pinned_hook_entry_command(prefix: &[String], cmd_suffix: &str) -> String {
     let prefix = if prefix.is_empty() {
         vec!["hcom".to_string()]
@@ -3208,6 +3210,13 @@ pub enum VerifyFailReason {
         hook_type: String,
         cmd_suffix: String,
     },
+    #[error(
+        "hcom hook command '{cmd_suffix}' under hook type '{hook_type}' is not the current pinned command"
+    )]
+    HookCommandNotPinned {
+        hook_type: String,
+        cmd_suffix: String,
+    },
     #[error("hook type '{hook_type}' matcher mismatch: expected {expected:?}, got {actual:?}")]
     HookMatcherMismatch {
         hook_type: String,
@@ -3434,6 +3443,19 @@ fn verify_claude_hooks_inner(
                     {
                         return Err(VerifyFailReason::HookTimeoutMissing {
                             hook_type: hook_type.to_string(),
+                        });
+                    }
+
+                    // On Windows the hook must invoke the exact executable
+                    // that installed it.  Accepting ${HCOM:-hcom} or a bare
+                    // `hcom` here makes the launcher report "already
+                    // installed" while leaving a stale PATH-selected copy
+                    // active after an upgrade.
+                    #[cfg(windows)]
+                    if command != build_hook_entry_command(cmd_suffix) {
+                        return Err(VerifyFailReason::HookCommandNotPinned {
+                            hook_type: hook_type.to_string(),
+                            cmd_suffix: cmd_suffix.to_string(),
                         });
                     }
 
@@ -4510,13 +4532,20 @@ mod tests {
 
         // Can't call setup_claude_hooks directly (uses get_claude_settings_path),
         // but we can test the verify path with a hand-built settings file.
+        #[cfg(windows)]
+        let hook_cmd = "";
+        #[cfg(not(windows))]
         let hook_cmd = "${HCOM}";
         let mut settings = serde_json::json!({"hooks": {}, "env": {"HCOM": "hcom"}});
 
         for &(hook_type, matcher, cmd_suffix, timeout) in CLAUDE_HOOK_CONFIGS {
             let mut hook_entry = serde_json::json!({
                 "type": "command",
-                "command": format!("{} {}", hook_cmd, cmd_suffix),
+                "command": if hook_cmd.is_empty() {
+                    build_hook_entry_command(cmd_suffix)
+                } else {
+                    format!("{} {}", hook_cmd, cmd_suffix)
+                },
             });
             if let Some(t) = timeout {
                 hook_entry["timeout"] = serde_json::json!(t);
@@ -4546,6 +4575,11 @@ mod tests {
         crate::config::Config::init();
         let dir = tempfile::tempdir().unwrap();
         let settings_path = dir.path().join("settings.json");
+        #[cfg(windows)]
+        let prefix = crate::runtime_env::windows_current_hcom_executable()
+            .map(|path| vec![path])
+            .unwrap();
+        #[cfg(not(windows))]
         let prefix = vec!["C:/Program Files/hcom/hcom.exe".to_string()];
         let mut settings = serde_json::json!({"hooks": {}, "env": {"HCOM": "hcom"}});
 
@@ -4606,13 +4640,20 @@ mod tests {
         new_timeout: Option<u64>,
         include_permissions: bool,
     ) {
+        #[cfg(windows)]
+        let hook_cmd = "";
+        #[cfg(not(windows))]
         let hook_cmd = "${HCOM}";
         let mut settings = serde_json::json!({"hooks": {}, "env": {"HCOM": "hcom"}});
 
         for &(hook_type, matcher, cmd_suffix, timeout) in CLAUDE_HOOK_CONFIGS {
             let mut hook_entry = serde_json::json!({
                 "type": "command",
-                "command": format!("{} {}", hook_cmd, cmd_suffix),
+                "command": if hook_cmd.is_empty() {
+                    build_hook_entry_command(cmd_suffix)
+                } else {
+                    format!("{} {}", hook_cmd, cmd_suffix)
+                },
             });
             if timeout.is_some()
                 && let Some(t) = new_timeout
@@ -5001,6 +5042,83 @@ mod tests {
         assert_eq!(first, second, "setup should be idempotent");
 
         drop(_guard);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    #[serial]
+    fn test_setup_claude_upgrades_legacy_commands_to_current_pinned_path() {
+        let (_dir, _test_home, settings_path, _guard) = claude_test_env();
+        std::fs::create_dir_all(settings_path.parent().unwrap()).unwrap();
+
+        // This is the configuration produced by older hcom builds.  Include
+        // an unrelated hook to prove repair does not remove foreign entries.
+        let mut settings = serde_json::json!({
+            "env": {"HCOM": "hcom"},
+            "hooks": {
+                "PostToolUse": [{"hooks": [{
+                    "type": "command",
+                    "command": "${HCOM:-hcom} post",
+                    "timeout": 5
+                }, {
+                    "type": "command",
+                    "command": "echo keep-me"
+                }]}]
+            }
+        });
+        std::fs::write(
+            &settings_path,
+            serde_json::to_string_pretty(&settings).unwrap(),
+        )
+        .unwrap();
+
+        assert!(!verify_claude_hooks_installed(Some(&settings_path), false));
+        assert!(setup_claude_hooks(false));
+        settings = read_json(&settings_path);
+
+        for &(hook_type, _, cmd_suffix, _) in CLAUDE_HOOK_CONFIGS {
+            let expected = build_hook_entry_command(cmd_suffix);
+            let commands: Vec<&str> = settings["hooks"][hook_type]
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|matcher| matcher["hooks"].as_array().unwrap())
+                .filter_map(|hook| hook["command"].as_str())
+                .collect();
+            assert!(
+                commands.iter().any(|command| *command == expected),
+                "{hook_type} was not pinned"
+            );
+            assert!(
+                commands
+                    .iter()
+                    .all(|command| !command.contains("${HCOM") && !command.eq(&"hcom"))
+            );
+        }
+
+        let post = &settings["hooks"]["PostToolUse"];
+        let post_hooks: Vec<&Value> = post
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|matcher| matcher["hooks"].as_array().unwrap())
+            .collect();
+        assert!(
+            post_hooks
+                .iter()
+                .any(|hook| hook["command"] == "echo keep-me")
+        );
+        assert_eq!(
+            post_hooks
+                .iter()
+                .find(|hook| hook["command"] == build_hook_entry_command("post"))
+                .and_then(|hook| hook["timeout"].as_u64()),
+            Some(5)
+        );
+
+        let first = std::fs::read_to_string(&settings_path).unwrap();
+        assert!(setup_claude_hooks(false));
+        assert_eq!(first, std::fs::read_to_string(&settings_path).unwrap());
     }
 
     #[test]

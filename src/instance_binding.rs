@@ -983,49 +983,17 @@ fn auto_subscribe_defaults(db: &HcomDb, instance_name: &str, tool: &str) {
         return;
     }
 
-    let _ = db.cleanup_subscriptions(instance_name);
-    let _ = db.cleanup_thread_memberships_for_name_reuse(instance_name);
     let config = match crate::config::HcomConfig::load(None) {
         Ok(c) => c,
         Err(_) => return,
     };
-    if config.auto_subscribe.is_empty() {
-        return;
-    }
-
-    use std::collections::HashMap;
-
-    let preset_to_flags: HashMap<&str, Vec<(&str, &str)>> = HashMap::from([
-        ("collision", vec![("collision", "1")]),
-        ("created", vec![("action", "created")]),
-        ("stopped", vec![("action", "stopped")]),
-        ("blocked", vec![("status", "blocked")]),
-    ]);
-
-    for preset in config
-        .auto_subscribe
-        .split(',')
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-    {
-        if let Some(flag_pairs) = preset_to_flags.get(preset) {
-            let mut filters: HashMap<String, Vec<String>> = HashMap::new();
-            for (key, val) in flag_pairs {
-                filters
-                    .entry(key.to_string())
-                    .or_default()
-                    .push(val.to_string());
-            }
-            let _ = crate::db::subscriptions::create_filter_subscription(
-                db,
-                &filters,
-                &[],
-                instance_name,
-                false,
-                None,
-            );
-        }
-    }
+    let _ = crate::db::subscriptions::replace_default_event_subscriptions(
+        db.conn(),
+        instance_name,
+        &config.auto_subscribe,
+        crate::shared::time::now_epoch_f64(),
+        db.get_last_event_id(),
+    );
 }
 
 #[cfg(test)]

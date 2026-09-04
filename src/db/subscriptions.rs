@@ -23,8 +23,8 @@
 
 use std::collections::{HashMap, HashSet};
 
-use anyhow::Result;
-use rusqlite::params;
+use anyhow::{Result, bail};
+use rusqlite::{Connection, params};
 use serde_json::json;
 
 use super::HcomDb;
@@ -56,6 +56,92 @@ pub(crate) fn thread_membership_sub_id(thread: &str, member: &str) -> String {
 pub(crate) enum SubCreateOutcome {
     Created { id: String, final_sql: String },
     AlreadyExists { id: String },
+}
+
+/// Replace an identity's configured automatic event subscriptions using the
+/// caller's current transaction. This is the transactional counterpart to
+/// `create_filter_subscription`: identity creation can fail atomically rather
+/// than becoming durable without its required subscriptions.
+pub(crate) fn replace_default_event_subscriptions(
+    connection: &Connection,
+    caller: &str,
+    presets: &str,
+    created: f64,
+    last_id: i64,
+) -> Result<()> {
+    connection.execute(
+        "DELETE FROM kv
+         WHERE key LIKE 'events_sub:%'
+           AND json_extract(value, '$.caller') = ?1
+           AND COALESCE(json_extract(value, '$.delivery_only'), 0) != 1",
+        params![caller],
+    )?;
+    connection.execute(
+        "DELETE FROM kv
+         WHERE key LIKE 'events_sub:%'
+           AND json_extract(value, '$.caller') = ?1
+           AND json_extract(value, '$.auto_thread_member') = 1
+           AND COALESCE(json_extract(value, '$.delivery_only'), 0) = 1",
+        params![caller],
+    )?;
+
+    let preset_to_flags: HashMap<&str, Vec<(&str, &str)>> = HashMap::from([
+        ("collision", vec![("collision", "1")]),
+        ("created", vec![("action", "created")]),
+        ("stopped", vec![("action", "stopped")]),
+        ("blocked", vec![("status", "blocked")]),
+    ]);
+    let mut seen_presets = HashSet::new();
+    for preset in presets
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        if !seen_presets.insert(preset) {
+            continue;
+        }
+        let Some(flag_pairs) = preset_to_flags.get(preset) else {
+            bail!("unsupported auto-subscribe preset '{preset}'");
+        };
+        let mut filters: HashMap<String, Vec<String>> = HashMap::new();
+        for (key, value) in flag_pairs {
+            filters
+                .entry((*key).to_string())
+                .or_default()
+                .push((*value).to_string());
+        }
+        let mut sql = build_sql_from_flags(&filters)
+            .map_err(|error| anyhow::anyhow!("auto-subscribe filter error: {error}"))?;
+        if sql.is_empty() {
+            bail!("auto-subscribe preset '{preset}' produced an empty filter");
+        }
+        if filters.contains_key("collision") {
+            let self_relevance = collision_self_relevance_sql(caller);
+            sql = format!("({sql}) AND {self_relevance}");
+        }
+        let serialized_filters = serde_json::to_string(&filters)?;
+        let id_source = format!("{caller}:{serialized_filters}:{sql}:false:");
+        let hash = sha256_hash(&id_source);
+        let sub_id = format!("sub-{}", &hash[..8]);
+        let sub_key = format!("events_sub:{sub_id}");
+        let sub_data = json!({
+            "id": sub_id,
+            "caller": caller,
+            "filters": filters,
+            "sql": sql,
+            "created": created,
+            "last_id": last_id,
+            "once": false,
+        });
+        let inserted = connection.execute(
+            "INSERT INTO kv (key, value) VALUES (?1, ?2)",
+            params![sub_key, serde_json::to_string(&sub_data)?],
+        )?;
+        if inserted != 1 {
+            bail!("failed to create automatic subscription '{preset}' for '{caller}'");
+        }
+    }
+    Ok(())
 }
 
 /// Build and insert a filter-based subscription row into `kv`.

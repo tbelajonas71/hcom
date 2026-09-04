@@ -474,32 +474,19 @@ fn codex_hook_cwd(ctx: &HcomContext, payload: &HookPayload) -> String {
         .unwrap_or_else(|| ctx.cwd.to_string_lossy().to_string())
 }
 
-/// Accept a native Codex lifecycle payload only when the task identity exposed
-/// to the hook process agrees with the payload. The payload session id is the
-/// single canonical identity used by SessionStart after this check; ambient
-/// CLI environment alone never authorizes a registration move.
-fn canonical_sessionstart_id<'a>(ctx: &HcomContext, payload: &'a HookPayload) -> Option<&'a str> {
+/// Return the non-empty identity supplied by Codex's native SessionStart
+/// payload. Codex does not inject `CODEX_THREAD_ID` or `CODEX_SESSION_ID` into
+/// hook subprocesses, so ambient variables are not part of this contract.
+/// Ownership is established separately: launched sessions require an existing
+/// process binding, while Desktop restores only an exact stopped/session-bound
+/// Codex identity with the existing directory guards.
+fn canonical_sessionstart_id(payload: &HookPayload) -> Option<&str> {
     let payload_id = payload.session_id.as_deref()?.trim();
-    let context_id = ctx.codex_thread_id.as_deref()?.trim();
-    let session_env = ctx
-        .raw_env
-        .get("CODEX_SESSION_ID")
-        .map(String::as_str)
-        .map(str::trim)
-        .unwrap_or("");
-    if payload_id.is_empty()
-        || context_id.is_empty()
-        || session_env.is_empty()
-        || payload_id != context_id
-        || payload_id != session_env
-    {
+    if payload_id.is_empty() {
         log::log_warn(
             "hooks",
-            "codex.sessionstart_identity_mismatch",
-            &format!(
-                "payload_session_id={} context_thread_id={} context_session_id={} mutated=false",
-                payload_id, context_id, session_env
-            ),
+            "codex.sessionstart_missing_identity",
+            "mutated=false",
         );
         return None;
     }
@@ -679,6 +666,40 @@ fn resolve_sessionstart_instance(
     // to restore an identity removed by stop/exit cleanup: doing this in the
     // shared resolver would undo an intentional stop on every later hook.
     if let Some(process_id) = ctx.process_id.as_deref() {
+        let process_owner = match db.get_process_binding(process_id) {
+            Ok(Some(name)) => name,
+            Ok(None) => {
+                log::log_warn(
+                    "hooks",
+                    "codex.sessionstart_missing_process_binding",
+                    &format!("process_id={process_id} mutated=false"),
+                );
+                return None;
+            }
+            Err(error) => {
+                log::log_error(
+                    "hooks",
+                    "codex.sessionstart_process_binding_read",
+                    &format!("process_id={process_id} error={error} mutated=false"),
+                );
+                return None;
+            }
+        };
+        let process_owner_is_codex = db
+            .get_instance_full(&process_owner)
+            .ok()
+            .flatten()
+            .is_some_and(|instance| {
+                instance.tool == "codex" && !instances::is_remote_instance(&instance)
+            });
+        if !process_owner_is_codex {
+            log::log_warn(
+                "hooks",
+                "codex.sessionstart_incompatible_process_binding",
+                &format!("process_id={process_id} instance={process_owner} mutated=false"),
+            );
+            return None;
+        }
         return instance_binding::bind_session_to_process(db, session_id, Some(process_id));
     }
 
@@ -701,7 +722,7 @@ fn resolve_sessionstart_instance(
 }
 
 fn handle_sessionstart(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) -> HookResult {
-    let Some(session_id) = canonical_sessionstart_id(ctx, payload) else {
+    let Some(session_id) = canonical_sessionstart_id(payload) else {
         return hook_noop();
     };
 
@@ -3035,6 +3056,16 @@ mod tests {
         HcomContext::from_env(&env, PathBuf::from(cwd))
     }
 
+    fn launched_codex_test_ctx(process_id: &str, cwd: &str) -> HcomContext {
+        let mut env = std::env::vars().collect::<HashMap<_, _>>();
+        env.insert("HCOM_PROCESS_ID".to_string(), process_id.to_string());
+        env.insert("HCOM_LAUNCHED".to_string(), "1".to_string());
+        env.insert("CODEX_SANDBOX".to_string(), "1".to_string());
+        env.remove("CODEX_THREAD_ID");
+        env.remove("CODEX_SESSION_ID");
+        HcomContext::from_env(&env, PathBuf::from(cwd))
+    }
+
     fn codex_test_payload(event: &str, session_id: &str, cwd: &str) -> HookPayload {
         HookPayload::from_codex_native(
             event,
@@ -3079,6 +3110,97 @@ mod tests {
             }),
         )
         .unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn test_sessionstart_binds_launched_process_without_ambient_codex_ids() {
+        let (_tmp, _hcom_dir, _home, _guard) = isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        let process_id = "process-native-sessionstart";
+        let session_id = "thread-native-sessionstart";
+        let name = "codex-launched";
+        let cwd = "/tmp/project";
+
+        assert!(instance_binding::initialize_instance_in_position_file(
+            &db,
+            name,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("codex"),
+            false,
+            None,
+            None,
+            None,
+            None,
+            Some(cwd),
+        ));
+        db.set_process_binding(process_id, "", name).unwrap();
+
+        let ctx = launched_codex_test_ctx(process_id, cwd);
+        assert!(ctx.codex_thread_id.is_none());
+        assert!(!ctx.raw_env.contains_key("CODEX_SESSION_ID"));
+        let payload = codex_test_payload("SessionStart", session_id, cwd);
+        let _ = handle_sessionstart(&db, &ctx, &payload);
+
+        let row = db.get_instance_full(name).unwrap().unwrap();
+        assert_eq!(row.session_id.as_deref(), Some(session_id));
+        assert_eq!(row.status, ST_LISTENING);
+        assert_eq!(
+            db.get_session_binding(session_id).unwrap().as_deref(),
+            Some(name)
+        );
+        assert_eq!(
+            db.get_process_binding(process_id).unwrap().as_deref(),
+            Some(name)
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_sessionstart_refuses_unbound_or_non_codex_process_anchor() {
+        let (_tmp, _hcom_dir, _home, _guard) = isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        let session_id = "thread-untrusted-process";
+        let cwd = "/tmp/project";
+        let payload = codex_test_payload("SessionStart", session_id, cwd);
+
+        let missing = launched_codex_test_ctx("process-missing", cwd);
+        let _ = handle_sessionstart(&db, &missing, &payload);
+        assert!(db.get_session_binding(session_id).unwrap().is_none());
+
+        let name = "claude-placeholder";
+        assert!(instance_binding::initialize_instance_in_position_file(
+            &db,
+            name,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("claude"),
+            false,
+            None,
+            None,
+            None,
+            None,
+            Some(cwd),
+        ));
+        db.set_process_binding("process-foreign", "", name).unwrap();
+        let foreign = launched_codex_test_ctx("process-foreign", cwd);
+        let _ = handle_sessionstart(&db, &foreign, &payload);
+
+        assert!(db.get_session_binding(session_id).unwrap().is_none());
+        assert!(db.get_instance_full(name).unwrap().is_some());
+        assert_eq!(
+            db.get_process_binding("process-foreign")
+                .unwrap()
+                .as_deref(),
+            Some(name)
+        );
     }
 
     #[test]
@@ -3389,30 +3511,35 @@ mod tests {
 
     #[test]
     #[serial]
-    fn test_sessionstart_refuses_missing_or_mismatched_context_identity() {
+    fn test_sessionstart_desktop_uses_native_payload_not_ambient_codex_ids() {
         let (_tmp, _hcom_dir, _home, _guard) = isolated_test_env();
         let db = HcomDb::open().unwrap();
         let session_id = "thread-owned";
         let name = "cultivation";
         let cwd = "/tmp/cultivation";
-        log_codex_stopped_snapshot(&db, name, session_id, "codex", "/tmp/old", 0);
+        log_codex_stopped_snapshot(&db, name, session_id, "codex", cwd, 0);
 
-        let missing_ctx = codex_test_ctx("", cwd);
+        let mut env = std::env::vars().collect::<HashMap<_, _>>();
+        env.remove("HCOM_PROCESS_ID");
+        env.remove("CODEX_THREAD_ID");
+        env.remove("CODEX_SESSION_ID");
+        env.insert("CODEX_SANDBOX".to_string(), "1".to_string());
+        let missing_ctx = HcomContext::from_env(&env, PathBuf::from(cwd));
         let payload = codex_test_payload("SessionStart", session_id, cwd);
         let _ = handle_sessionstart(&db, &missing_ctx, &payload);
-        assert!(db.get_instance_full(name).unwrap().is_none());
 
-        let mismatched_ctx = codex_test_ctx("thread-foreign", cwd);
-        let _ = handle_sessionstart(&db, &mismatched_ctx, &payload);
-        assert!(db.get_instance_full(name).unwrap().is_none());
-
-        let mut mismatched_session_env = codex_test_ctx(session_id, cwd);
-        mismatched_session_env
-            .raw_env
-            .insert("CODEX_SESSION_ID".into(), "thread-foreign".into());
-        let _ = handle_sessionstart(&db, &mismatched_session_env, &payload);
-        assert!(db.get_instance_full(name).unwrap().is_none());
-        assert!(db.get_session_binding(session_id).unwrap().is_none());
+        assert_eq!(
+            db.get_instance_full(name)
+                .unwrap()
+                .unwrap()
+                .session_id
+                .as_deref(),
+            Some(session_id)
+        );
+        assert_eq!(
+            db.get_session_binding(session_id).unwrap().as_deref(),
+            Some(name)
+        );
     }
 
     #[test]

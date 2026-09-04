@@ -186,7 +186,7 @@ pub fn get_instance_status(data: &InstanceRow, db: &HcomDb) -> ComputedStatus {
     let wake_grace = is_in_wake_grace();
     let now = now_epoch_i64();
 
-    if status_context == "new" && (status == ST_INACTIVE || status == "pending") {
+    if crate::instances::is_launching_placeholder(data) {
         let created_at = data.created_at as i64;
         let age = if created_at > 0 { now - created_at } else { 0 };
         if age < LAUNCH_PLACEHOLDER_TIMEOUT {
@@ -203,9 +203,24 @@ pub fn get_instance_status(data: &InstanceRow, db: &HcomDb) -> ComputedStatus {
             };
         }
 
-        let detail = get_or_finalize_launch_failure_detail(db, data)
-            .or_else(|| extract_launch_failure_detail(data))
-            .unwrap_or_else(|| "launch probably failed - check logs or hcom list -v".to_string());
+        let detail = match get_or_finalize_launch_failure_detail(db, data) {
+            Some(detail) => detail,
+            None => {
+                // The finalizer is a current-generation CAS. A miss commonly
+                // means the hook bound or advanced this row after the caller's
+                // list snapshot. Render the current row instead of reporting a
+                // launch failure that is true only of the stale snapshot.
+                if let Ok(Some(current)) = db.get_instance_full(&data.name)
+                    && (current.created_at != data.created_at
+                        || !crate::instances::is_launching_placeholder(&current))
+                {
+                    return get_instance_status(&current, db);
+                }
+                extract_launch_failure_detail(data).unwrap_or_else(|| {
+                    "launch probably failed - check logs or hcom list -v".to_string()
+                })
+            }
+        };
         return ComputedStatus {
             status: ST_INACTIVE.to_string(),
             age_string: format_age(age),
@@ -339,7 +354,7 @@ pub(crate) fn finalize_launch_failure_detail(
         return Some(data.status_detail.clone());
     }
 
-    if data.status_context != "new" || (data.status != ST_INACTIVE && data.status != "pending") {
+    if !crate::instances::is_launching_placeholder(data) {
         return if data.status_context == "launch_failed" {
             extract_launch_failure_detail(data)
                 .or_else(|| fallback_detail.map(ToString::to_string))
@@ -394,25 +409,81 @@ pub(crate) fn finalize_launch_failure_detail(
         detail.push_str(&evidence);
     }
 
-    let mut updates = serde_json::Map::new();
-    updates.insert("status".into(), serde_json::json!(ST_INACTIVE));
-    updates.insert("status_time".into(), serde_json::json!(now_epoch_i64()));
-    updates.insert("status_context".into(), serde_json::json!("launch_failed"));
-    updates.insert("status_detail".into(), serde_json::json!(detail.clone()));
-    crate::instances::update_instance_position(db, &data.name, &updates);
+    // A status/list process can hold this snapshot while a hook binds the
+    // session (or while the name is deleted and recreated). Re-check the
+    // current generation under the write lock, and commit the state change and
+    // its event together so a stale observer cannot overwrite the binding.
+    let status_time = now_epoch_i64();
+    let timestamp = crate::db::chrono_now_iso();
+    let expected_created_at = data.created_at;
+    let committed = db.with_immediate_transaction(|txn| {
+        let updated = txn.execute(
+            "UPDATE instances
+             SET status = ?1, status_time = ?2,
+                 status_context = 'launch_failed', status_detail = ?3
+             WHERE name = ?4 AND created_at = ?5
+               AND (session_id IS NULL OR session_id = '')
+               AND status_context = 'new'
+               AND status IN (?1, 'pending')",
+            rusqlite::params![
+                ST_INACTIVE,
+                status_time,
+                &detail,
+                &data.name,
+                expected_created_at
+            ],
+        )?;
+        if updated == 0 {
+            return Ok(None);
+        }
 
-    let mut event_data = serde_json::json!({
-        "status": ST_INACTIVE,
-        "context": "launch_failed",
-        "position": data.last_event_id,
-        "detail": detail.clone(),
+        let position: i64 = txn
+            .query_row(
+                "SELECT last_event_id FROM instances
+                 WHERE name = ?1 AND created_at = ?2",
+                rusqlite::params![&data.name, expected_created_at],
+                |row| row.get::<_, Option<i64>>(0),
+            )?
+            .unwrap_or(0);
+        let mut event_data = serde_json::json!({
+            "status": ST_INACTIVE,
+            "context": "launch_failed",
+            "position": position,
+            "detail": detail.clone(),
+        });
+        if detail.is_empty() {
+            event_data.as_object_mut().map(|obj| obj.remove("detail"));
+        }
+        let event_json = serde_json::to_string(&event_data)?;
+        txn.execute(
+            "INSERT INTO events (timestamp, type, instance, data)
+             VALUES (?1, 'status', ?2, ?3)",
+            rusqlite::params![&timestamp, &data.name, event_json],
+        )?;
+        Ok(Some((txn.last_insert_rowid(), event_data)))
     });
-    if detail.is_empty() {
-        event_data.as_object_mut().map(|obj| obj.remove("detail"));
-    }
-    let _ = db.log_event("status", &data.name, &event_data);
 
-    Some(detail)
+    match committed {
+        Ok(Some((event_id, event_data))) => {
+            crate::db::subscriptions::process_logged_event(
+                db,
+                event_id,
+                "status",
+                &data.name,
+                &event_data,
+            );
+            Some(detail)
+        }
+        Ok(None) => None,
+        Err(error) => {
+            crate::log::log_warn(
+                "lifecycle",
+                "launch_failure_finalize_failed",
+                &format!("{}: {error}", data.name),
+            );
+            None
+        }
+    }
 }
 
 fn extract_launch_failure_detail(data: &InstanceRow) -> Option<String> {
@@ -674,13 +745,16 @@ pub fn cleanup_stale_placeholders(db: &HcomDb) -> i32 {
                 continue;
             }
             let created_at = data.created_at;
-            if created_at > 0.0 && (now - created_at) > CLEANUP_PLACEHOLDER_THRESHOLD as f64 {
-                crate::hooks::common::stop_placeholder_instance(
+            if created_at > 0.0
+                && (now - created_at) > CLEANUP_PLACEHOLDER_THRESHOLD as f64
+                && crate::hooks::common::stop_placeholder_instance(
                     db,
                     &data.name,
+                    data.created_at,
                     "system",
                     "stale_cleanup",
-                );
+                ) == crate::hooks::common::StopOutcome::Stopped
+            {
                 deleted += 1;
             }
         }
@@ -851,6 +925,18 @@ mod tests {
             name_announced: 0,
             idle_since: None,
         }
+    }
+
+    fn launch_failed_status_event_count(db: &HcomDb, name: &str) -> i64 {
+        db.conn()
+            .query_row(
+                "SELECT COUNT(*) FROM events
+                 WHERE type = 'status' AND instance = ?1
+                   AND json_extract(data, '$.context') = 'launch_failed'",
+                rusqlite::params![name],
+                |row| row.get(0),
+            )
+            .unwrap()
     }
 
     #[test]
@@ -1059,6 +1145,114 @@ mod tests {
             stored.status_detail,
             "process exited before startup completed (exit code 1)"
         );
+        assert_eq!(launch_failed_status_event_count(&db, "test"), 1);
+
+        assert_eq!(
+            finalize_launch_failure_detail(
+                &db,
+                &data,
+                Some("process exited before startup completed (exit code 1)"),
+            ),
+            None,
+            "a stale placeholder snapshot must not finalize the row twice"
+        );
+        assert_eq!(launch_failed_status_event_count(&db, "test"), 1);
+        cleanup(path);
+    }
+
+    #[test]
+    fn test_bound_new_instance_never_becomes_launch_failed() {
+        let (db, path) = setup_test_db();
+        let created_at = (now_epoch_i64() - LAUNCH_PLACEHOLDER_TIMEOUT - 1) as f64;
+
+        let mut row = serde_json::Map::new();
+        row.insert("name".into(), serde_json::json!("test"));
+        row.insert("session_id".into(), serde_json::json!("thread-test"));
+        row.insert("status".into(), serde_json::json!(ST_INACTIVE));
+        row.insert("status_context".into(), serde_json::json!("new"));
+        row.insert("created_at".into(), serde_json::json!(created_at));
+        row.insert("status_time".into(), serde_json::json!(0));
+        row.insert("tool".into(), serde_json::json!("codex"));
+        db.save_instance_named("test", &row).unwrap();
+        db.set_session_binding("thread-test", "test").unwrap();
+
+        let data = db.get_instance_full("test").unwrap().unwrap();
+        let computed = get_instance_status(&data, &db);
+        assert_eq!(computed.status, ST_INACTIVE);
+        assert_eq!(computed.context, "new");
+        assert_ne!(computed.context, "launch_failed");
+
+        let stored = db.get_instance_full("test").unwrap().unwrap();
+        assert_eq!(stored.session_id.as_deref(), Some("thread-test"));
+        assert_eq!(stored.status_context, "new");
+        assert_eq!(
+            db.get_session_binding("thread-test").unwrap().as_deref(),
+            Some("test")
+        );
+        assert_eq!(launch_failed_status_event_count(&db, "test"), 0);
+        cleanup(path);
+    }
+
+    #[test]
+    fn test_stale_placeholder_snapshot_cannot_overwrite_session_binding() {
+        let (db, path) = setup_test_db();
+        let created_at = (now_epoch_i64() - LAUNCH_PLACEHOLDER_TIMEOUT - 1) as f64;
+
+        let mut row = serde_json::Map::new();
+        row.insert("name".into(), serde_json::json!("test"));
+        row.insert("status".into(), serde_json::json!(ST_INACTIVE));
+        row.insert("status_context".into(), serde_json::json!("new"));
+        row.insert("created_at".into(), serde_json::json!(created_at));
+        row.insert("status_time".into(), serde_json::json!(0));
+        row.insert("tool".into(), serde_json::json!("codex"));
+        db.save_instance_named("test", &row).unwrap();
+        let stale = db.get_instance_full("test").unwrap().unwrap();
+
+        let mut updates = serde_json::Map::new();
+        updates.insert("session_id".into(), serde_json::json!("thread-test"));
+        db.update_instance_fields("test", &updates).unwrap();
+        db.set_session_binding("thread-test", "test").unwrap();
+
+        assert_eq!(finalize_launch_failure_detail(&db, &stale, None), None);
+        let computed = get_instance_status(&stale, &db);
+        assert_eq!(computed.status, ST_INACTIVE);
+        assert_eq!(computed.context, "new");
+        let stored = db.get_instance_full("test").unwrap().unwrap();
+        assert_eq!(stored.session_id.as_deref(), Some("thread-test"));
+        assert_eq!(stored.status_context, "new");
+        assert_eq!(
+            db.get_session_binding("thread-test").unwrap().as_deref(),
+            Some("test")
+        );
+        assert_eq!(launch_failed_status_event_count(&db, "test"), 0);
+        cleanup(path);
+    }
+
+    #[test]
+    fn test_stale_placeholder_snapshot_cannot_overwrite_new_generation() {
+        let (db, path) = setup_test_db();
+        let old_created_at = (now_epoch_i64() - LAUNCH_PLACEHOLDER_TIMEOUT - 2) as f64;
+        let new_created_at = old_created_at + 1.0;
+
+        let mut row = serde_json::Map::new();
+        row.insert("name".into(), serde_json::json!("test"));
+        row.insert("status".into(), serde_json::json!(ST_INACTIVE));
+        row.insert("status_context".into(), serde_json::json!("new"));
+        row.insert("created_at".into(), serde_json::json!(old_created_at));
+        row.insert("status_time".into(), serde_json::json!(0));
+        row.insert("tool".into(), serde_json::json!("codex"));
+        db.save_instance_named("test", &row).unwrap();
+        let stale = db.get_instance_full("test").unwrap().unwrap();
+
+        db.delete_instance("test").unwrap();
+        row.insert("created_at".into(), serde_json::json!(new_created_at));
+        db.save_instance_named("test", &row).unwrap();
+
+        assert_eq!(finalize_launch_failure_detail(&db, &stale, None), None);
+        let stored = db.get_instance_full("test").unwrap().unwrap();
+        assert_eq!(stored.created_at, new_created_at);
+        assert_eq!(stored.status_context, "new");
+        assert_eq!(launch_failed_status_event_count(&db, "test"), 0);
         cleanup(path);
     }
 
@@ -1307,6 +1501,196 @@ WARNING: proceeding, even though we could not update PATH: Operation not permitt
         let deleted = cleanup_stale_placeholders(&db);
         assert_eq!(deleted, 0);
         assert!(db.get_instance_full("real").unwrap().is_some());
+
+        cleanup(path);
+    }
+
+    #[test]
+    fn test_placeholder_cleanup_does_not_delete_instance_bound_after_scan() {
+        crate::config::Config::init();
+        let (db, path) = setup_test_db();
+
+        let old_time = now_epoch_f64() - 200.0;
+        let mut data = serde_json::Map::new();
+        data.insert("name".into(), serde_json::json!("raced"));
+        data.insert("status".into(), serde_json::json!("pending"));
+        data.insert("status_context".into(), serde_json::json!("new"));
+        data.insert("created_at".into(), serde_json::json!(old_time));
+        data.insert("tool".into(), serde_json::json!("codex"));
+        db.save_instance_named("raced", &data).unwrap();
+
+        // This is the row observed by cleanup_stale_placeholders before the
+        // hook wins the bind race.
+        let scanned = db.get_instance_full("raced").unwrap().unwrap();
+        let mut updates = serde_json::Map::new();
+        updates.insert("session_id".into(), serde_json::json!("thread-raced"));
+        db.update_instance_fields("raced", &updates).unwrap();
+        db.set_session_binding("thread-raced", "raced").unwrap();
+
+        assert_eq!(
+            crate::hooks::common::stop_placeholder_instance(
+                &db,
+                "raced",
+                scanned.created_at,
+                "system",
+                "stale_cleanup",
+            ),
+            crate::hooks::common::StopOutcome::AlreadyStopped
+        );
+        let stored = db.get_instance_full("raced").unwrap().unwrap();
+        assert_eq!(stored.session_id.as_deref(), Some("thread-raced"));
+        assert_eq!(stored.status_context, "new");
+        assert_eq!(
+            db.get_session_binding("thread-raced").unwrap().as_deref(),
+            Some("raced")
+        );
+        let stopped_events: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM events
+                 WHERE type = 'life' AND instance = 'raced'
+                   AND json_extract(data, '$.action') = 'stopped'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stopped_events, 0);
+
+        cleanup(path);
+    }
+
+    #[test]
+    fn test_placeholder_cleanup_does_not_signal_reused_pid() {
+        crate::config::Config::init();
+        let (db, path) = setup_test_db();
+
+        #[cfg(windows)]
+        let child = std::process::Command::new("cmd")
+            .args(["/C", "ping -n 31 127.0.0.1 >NUL"])
+            .spawn()
+            .unwrap();
+        #[cfg(not(windows))]
+        let child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+
+        struct ChildGuard(std::process::Child);
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let child = ChildGuard(child);
+        let pid = child.0.id();
+        let identity = crate::sys::process::identity(pid).unwrap();
+
+        let old_time = now_epoch_f64() - 200.0;
+        let mut data = serde_json::Map::new();
+        data.insert("name".into(), serde_json::json!("stale-pid"));
+        data.insert("status".into(), serde_json::json!("pending"));
+        data.insert("status_context".into(), serde_json::json!("new"));
+        data.insert("created_at".into(), serde_json::json!(old_time));
+        data.insert("background".into(), serde_json::json!(1));
+        data.insert("pid".into(), serde_json::json!(pid));
+        db.save_instance_named("stale-pid", &data).unwrap();
+
+        let outcome = crate::hooks::common::stop_placeholder_instance(
+            &db,
+            "stale-pid",
+            old_time,
+            "system",
+            "stale_cleanup",
+        );
+        let child_survived = crate::sys::process::has_identity(pid, &identity);
+
+        assert_eq!(outcome, crate::hooks::common::StopOutcome::Stopped);
+        assert!(db.get_instance_full("stale-pid").unwrap().is_none());
+        assert!(
+            child_survived,
+            "a stale row's numeric PID is not proof of process ownership"
+        );
+        drop(child);
+        cleanup(path);
+    }
+
+    #[test]
+    fn test_placeholder_replacement_created_by_stop_event_keeps_its_capability() {
+        crate::config::Config::init();
+        let (db, path) = setup_test_db();
+
+        let old_time = now_epoch_f64() - 200.0;
+        let replacement_time = now_epoch_f64();
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                 (name, status, status_context, created_at, tool)
+                 VALUES ('reused', 'pending', 'new', ?1, 'codex')",
+                rusqlite::params![old_time],
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO claude_actor_capabilities
+                 (token, session_id, tool_use_id, agent_id, instance_name,
+                  created_at, expires_at, last_seen)
+                 VALUES ('old-cap', 'old-session', 'old-tool', '', 'reused', 1, 9999999999, 1)",
+                [],
+            )
+            .unwrap();
+        db.conn()
+            .execute_batch(&format!(
+                "CREATE TRIGGER replace_placeholder_on_stop
+                 AFTER INSERT ON events
+                 WHEN NEW.type = 'life' AND NEW.instance = 'reused'
+                   AND json_extract(NEW.data, '$.placeholder') = 1
+                 BEGIN
+                   INSERT INTO instances
+                     (name, session_id, status, status_context, created_at, tool)
+                   VALUES
+                     ('reused', 'new-session', 'listening', '', {replacement_time}, 'codex');
+                   INSERT INTO session_bindings
+                     (session_id, instance_name, created_at)
+                   VALUES ('new-session', 'reused', {replacement_time});
+                   INSERT INTO claude_actor_capabilities
+                     (token, session_id, tool_use_id, agent_id, instance_name,
+                      created_at, expires_at, last_seen)
+                   VALUES
+                     ('new-cap', 'new-session', 'new-tool', '', 'reused', 2, 9999999999, 2);
+                 END;"
+            ))
+            .unwrap();
+
+        assert_eq!(
+            crate::hooks::common::stop_placeholder_instance(
+                &db,
+                "reused",
+                old_time,
+                "system",
+                "stale_cleanup",
+            ),
+            crate::hooks::common::StopOutcome::Stopped
+        );
+        let replacement = db.get_instance_full("reused").unwrap().unwrap();
+        assert_eq!(replacement.session_id.as_deref(), Some("new-session"));
+        assert_eq!(replacement.created_at, replacement_time);
+        assert_eq!(
+            db.get_session_binding("new-session").unwrap().as_deref(),
+            Some("reused")
+        );
+        let capabilities: Vec<String> = db
+            .conn()
+            .prepare(
+                "SELECT token FROM claude_actor_capabilities
+                 WHERE instance_name = 'reused' ORDER BY token",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(capabilities, vec!["new-cap"]);
 
         cleanup(path);
     }

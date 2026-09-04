@@ -1251,13 +1251,148 @@ pub enum StopOutcome {
     RetryableError(String),
 }
 
+fn instance_stop_snapshot(instance_name: &str, instance_data: &InstanceRow) -> Value {
+    serde_json::json!({
+        "name": instance_name,
+        "transcript_path": instance_data.transcript_path,
+        "session_id": instance_data.session_id,
+        "tool": instance_data.tool,
+        "directory": instance_data.directory,
+        "codex_directory_pin_v1": crate::hooks::codex::directory_override_snapshot_value(
+            instance_data.launch_context.as_deref(),
+            instance_data.session_id.as_deref(),
+        ),
+        "parent_name": instance_data.parent_name,
+        "parent_session_id": instance_data.parent_session_id,
+        "tag": instance_data.tag,
+        "wait_timeout": instance_data.wait_timeout,
+        "subagent_timeout": instance_data.subagent_timeout,
+        "hints": instance_data.hints,
+        "pid": instance_data.pid,
+        "created_at": instance_data.created_at,
+        "last_seen": instance_data.last_seen,
+        "background": instance_data.background,
+        "agent_id": instance_data.agent_id,
+        "name_announced": instance_data.name_announced,
+        "launch_args": instance_data.launch_args,
+        "origin_device_id": instance_data.origin_device_id,
+        "background_log_file": instance_data.background_log_file,
+        "last_event_id": instance_data.last_event_id,
+    })
+}
+
 pub(crate) fn stop_placeholder_instance(
     db: &HcomDb,
     instance_name: &str,
+    expected_created_at: f64,
     initiated_by: &str,
     reason: &str,
 ) -> StopOutcome {
-    stop_instance_inner(db, instance_name, initiated_by, reason, true, 0)
+    let instance_data = match db.get_instance_full(instance_name) {
+        Ok(Some(data)) => data,
+        Ok(None) => return StopOutcome::AlreadyStopped,
+        Err(error) => {
+            return StopOutcome::RetryableError(format!(
+                "could not read placeholder {instance_name}: {error}"
+            ));
+        }
+    };
+    if instance_data.created_at != expected_created_at
+        || !instances::is_launching_placeholder(&instance_data)
+    {
+        return StopOutcome::AlreadyStopped;
+    }
+
+    let event_data = serde_json::json!({
+        "action": "stopped",
+        "by": initiated_by,
+        "reason": reason,
+        "snapshot": instance_stop_snapshot(instance_name, &instance_data),
+        "placeholder": true,
+    });
+    let timestamp = crate::db::chrono_now_iso();
+    let event_json = match serde_json::to_string(&event_data) {
+        Ok(json) => json,
+        Err(error) => {
+            return StopOutcome::RetryableError(format!(
+                "could not serialize placeholder stop for {instance_name}: {error}"
+            ));
+        }
+    };
+
+    let finalized: Result<Option<i64>> = db.with_immediate_transaction(|txn| {
+        let deleted = txn.execute(
+            "DELETE FROM instances
+             WHERE name = ?1 AND created_at = ?2
+               AND (session_id IS NULL OR session_id = '')
+               AND status_context = 'new'
+               AND status IN ('inactive', 'pending')",
+            params![instance_name, expected_created_at],
+        )?;
+        if deleted == 0 {
+            return Ok(None);
+        }
+
+        txn.execute(
+            "DELETE FROM session_bindings WHERE instance_name = ?1",
+            params![instance_name],
+        )?;
+        txn.execute(
+            "DELETE FROM process_bindings WHERE instance_name = ?1",
+            params![instance_name],
+        )?;
+        txn.execute(
+            "DELETE FROM notify_endpoints WHERE instance = ?1",
+            params![instance_name],
+        )?;
+        txn.execute(
+            "DELETE FROM kv
+             WHERE key LIKE 'events_sub:%'
+               AND json_extract(value, '$.caller') = ?1
+               AND COALESCE(json_extract(value, '$.delivery_only'), 0) != 1",
+            params![instance_name],
+        )?;
+        txn.execute(
+            "DELETE FROM claude_actor_capabilities WHERE instance_name = ?1",
+            params![instance_name],
+        )?;
+        txn.execute(
+            "INSERT INTO events (timestamp, type, instance, data)
+             VALUES (?1, 'life', ?2, ?3)",
+            params![timestamp, instance_name, event_json],
+        )?;
+        Ok(Some(txn.last_insert_rowid()))
+    });
+
+    let event_id = match finalized {
+        Ok(Some(event_id)) => event_id,
+        Ok(None) => return StopOutcome::AlreadyStopped,
+        Err(error) => {
+            log::log_warn(
+                "hooks",
+                "finalize.placeholder_transaction_failed",
+                &format!("instance={instance_name} err={error}"),
+            );
+            return StopOutcome::RetryableError(format!(
+                "could not finalize placeholder stop for {instance_name}: {error}"
+            ));
+        }
+    };
+
+    crate::db::subscriptions::process_logged_event(
+        db,
+        event_id,
+        "life",
+        instance_name,
+        &event_data,
+    );
+    // Deliberately do not signal or re-track instance_data.pid here. The row
+    // stores only a numeric PID, not the process creation identity required to
+    // prove that the OS has not reused it during the 120-second stale window.
+    // Launch-process exit handling owns process cleanup while it still has that
+    // identity; this fallback owns only the stale database placeholder.
+    crate::relay::spawn_background_push();
+    StopOutcome::Stopped
 }
 
 /// Max recursion depth for subagent cleanup. Prevents stack overflow if DB
@@ -1410,35 +1545,8 @@ fn stop_instance_inner(
     // delete so any remaining listeners see the row is gone.
     let wake_ports = crate::notify::snapshot_wake_ports(db, instance_name);
 
-    // Prepare snapshot before delete (preserves data for transcript access)
-    // Use Option values directly so None serializes as JSON null
-    let snapshot = serde_json::json!({
-        "name": instance_name,
-        "transcript_path": instance_data.transcript_path,
-        "session_id": instance_data.session_id,
-        "tool": instance_data.tool,
-        "directory": instance_data.directory,
-        "codex_directory_pin_v1": crate::hooks::codex::directory_override_snapshot_value(
-            instance_data.launch_context.as_deref(),
-            instance_data.session_id.as_deref(),
-        ),
-        "parent_name": instance_data.parent_name,
-        "parent_session_id": instance_data.parent_session_id,
-        "tag": instance_data.tag,
-        "wait_timeout": instance_data.wait_timeout,
-        "subagent_timeout": instance_data.subagent_timeout,
-        "hints": instance_data.hints,
-        "pid": instance_data.pid,
-        "created_at": instance_data.created_at,
-        "last_seen": instance_data.last_seen,
-        "background": instance_data.background,
-        "agent_id": instance_data.agent_id,
-        "name_announced": instance_data.name_announced,
-        "launch_args": instance_data.launch_args,
-        "origin_device_id": instance_data.origin_device_id,
-        "background_log_file": instance_data.background_log_file,
-        "last_event_id": instance_data.last_event_id,
-    });
+    // Prepare snapshot before delete (preserves data for transcript access).
+    let snapshot = instance_stop_snapshot(instance_name, &instance_data);
 
     // Snapshot both child sets before deleting the parent. Only the teardown
     // winner processes them, but it still needs relationships that may be

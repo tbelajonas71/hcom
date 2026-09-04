@@ -390,6 +390,10 @@ const START_HELP: &[HelpEntry] = &[
         "Move a stopped top-level Codex identity to this task's directory",
     ),
     (
+        "start --as <name> --migrate-platform --registry <path>",
+        "One-off NSFW Studio Claude-to-Codex migration with exact stale-endpoint proofs",
+    ),
+    (
         "start --orphan <name|pid>",
         "Recover orphaned PTY process from pidtrack",
     ),

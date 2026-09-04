@@ -541,17 +541,25 @@ impl HcomDb {
         let now = now_epoch_f64();
         let validation_key = claude_lineage_validation_key(session_id);
         self.with_immediate_transaction(|txn| {
-            let old_primary_session = txn
+            let (old_primary_session, owner_tool) = txn
                 .query_row(
-                    "SELECT session_id FROM instances WHERE name = ?",
+                    "SELECT session_id, COALESCE(tool, '') FROM instances WHERE name = ?",
                     params![instance_name],
-                    |row| row.get::<_, Option<String>>(0),
+                    |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, String>(1)?)),
                 )
                 .optional()?
                 .ok_or_else(|| {
                     anyhow::anyhow!("Claude lineage owner {} does not exist", instance_name)
-                })?
-                .filter(|old_session_id| old_session_id != session_id);
+                })?;
+            if owner_tool != "claude" {
+                bail!(
+                    "cannot attach Claude generation to live non-Claude identity {} (tool={})",
+                    instance_name,
+                    owner_tool
+                );
+            }
+            let old_primary_session =
+                old_primary_session.filter(|old_session_id| old_session_id != session_id);
 
             // parent_session_id has an immediate FK to instances.session_id.
             // Detach known children before changing the root key, then restore
@@ -1091,6 +1099,51 @@ mod tests {
         );
         assert!(
             db.get_validated_claude_session_owner("sess-new")
+                .unwrap()
+                .is_none()
+        );
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn test_attach_claude_generation_cannot_steal_migrated_codex_identity() {
+        let (db, db_path) = setup_full_test_db();
+        db.conn
+            .execute(
+                "INSERT INTO instances (
+                    name, session_id, tool, directory, transcript_path, created_at
+                 ) VALUES (
+                    'nsfw-studio', 'codex-current', 'codex', '/project/nsfw',
+                    '/codex/current.jsonl', 1000.0
+                 )",
+                [],
+            )
+            .unwrap();
+        db.set_session_binding("codex-current", "nsfw-studio")
+            .unwrap();
+
+        let error = db
+            .attach_claude_generation(
+                "nsfw-studio",
+                "claude-stopped",
+                "/claude/stopped.jsonl",
+                "",
+                Some("nsfw-studio"),
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("live non-Claude identity"));
+
+        let row = db.get_instance_full("nsfw-studio").unwrap().unwrap();
+        assert_eq!(row.tool, "codex");
+        assert_eq!(row.session_id.as_deref(), Some("codex-current"));
+        assert_eq!(row.transcript_path, "/codex/current.jsonl");
+        assert_eq!(
+            db.get_session_binding("codex-current").unwrap().as_deref(),
+            Some("nsfw-studio")
+        );
+        assert!(db.get_session_binding("claude-stopped").unwrap().is_none());
+        assert!(
+            db.get_validated_claude_session_owner("claude-stopped")
                 .unwrap()
                 .is_none()
         );

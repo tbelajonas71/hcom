@@ -1789,6 +1789,50 @@ mod tests {
     }
 
     #[test]
+    #[serial]
+    fn send_mention_survives_cleanup_for_stale_hook_only_claude() {
+        let (db, path, _env) = setup_test_db();
+        let now = crate::shared::time::now_epoch_i64();
+        db.conn().execute(
+            "INSERT INTO instances
+             (name, session_id, tool, status, status_context, status_time, created_at, last_event_id)
+             VALUES ('luna', 'sess-luna', 'claude', 'active', '', ?1, ?1, 0),
+                    ('risa', 'sess-risa', 'claude', 'listening', '', ?2, 1, 0)",
+            rusqlite::params![now, now - 7200],
+        ).unwrap();
+        db.set_session_binding("sess-risa", "risa").unwrap();
+        let sender = SenderIdentity {
+            kind: SenderKind::Instance,
+            name: "luna".into(),
+            instance_data: None,
+            session_id: Some("sess-luna".into()),
+        };
+        assert_eq!(
+            crate::instance_lifecycle::cleanup_stale_instances(&db, 3600, 3600),
+            0
+        );
+        let queued = send_message(
+            &db,
+            &sender,
+            "retained-stale-hook",
+            None,
+            Some(&["risa".to_string()]),
+        )
+        .unwrap();
+        assert_eq!(queued, vec!["risa".to_string()]);
+        let unread = db.get_unread_messages("risa");
+        assert_eq!(unread.len(), 1);
+        assert_eq!(unread[0].text, "retained-stale-hook");
+        assert_eq!(db.get_cursor("risa"), 0, "queued is not read");
+        assert_eq!(
+            crate::instance_lifecycle::cleanup_stale_instances(&db, 3600, 3600),
+            0
+        );
+        assert_eq!(db.get_unread_messages("risa").len(), 1);
+        cleanup_test_db(path);
+    }
+
+    #[test]
     fn process_compat_at_with_space() {
         // "@luna hi" → full text as message, no targets
         let (targets, msg) = process_positionals(&["@luna hi".to_string()]);

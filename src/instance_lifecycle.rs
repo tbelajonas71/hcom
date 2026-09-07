@@ -62,7 +62,7 @@ pub struct ComputedStatus {
 
 pub use crate::shared::time::format_age;
 
-/// Whether this row represents a live Claude session that can only receive
+/// Whether this row represents a bound Claude session that can only receive
 /// messages at hook boundaries (for example, Claude Desktop).
 ///
 /// The session binding is the durable ownership signal. Hard stops delete it,
@@ -785,15 +785,16 @@ pub fn cleanup_stale_instances(
                 continue;
             }
 
-            // A Claude Stop-hook poll timeout is ordinary idle state, not a
-            // session stop. Older binaries persisted that state as
-            // inactive/exit:timeout; retain such rows while their exact hook
-            // binding remains live so queued messages survive until the next
-            // supported hook boundary. Explicit stop/SessionEnd removes the
-            // binding and therefore does not take this path.
-            if data.status == ST_INACTIVE
-                && data.status_context == "exit:timeout"
-                && is_hook_only_claude_session(data, db)
+            // Silence between app hook boundaries is not a session stop.
+            // It can be stored as inactive/exit:timeout OR computed as stale
+            // from an old active/listening/blocked row. Retain the exact
+            // hook-only binding and pending queue for both cases. Do not
+            // refresh timestamps or report the session alive: computed status
+            // stays stale. Explicit stops/end and non-hook ownership continue
+            // through the existing cleanup paths.
+            if is_hook_only_claude_session(data, db)
+                && (computed.context == "stale"
+                    || (data.status == ST_INACTIVE && data.status_context == "exit:timeout"))
             {
                 continue;
             }
@@ -1734,5 +1735,107 @@ WARNING: proceeding, even though we could not update PATH: Operation not permitt
         assert!(db.get_instance_full("risa").unwrap().is_none());
 
         cleanup(path);
+    }
+
+    #[test]
+    fn cleanup_preserves_bound_hook_only_claude_stale_states() {
+        crate::config::Config::init();
+        for state in [ST_LISTENING, ST_ACTIVE, ST_BLOCKED] {
+            let (db, path) = setup_test_db();
+            let old = now_epoch_i64() - 7200;
+            db.conn()
+                .execute(
+                    "INSERT INTO instances
+                 (name, session_id, tool, status, status_context, status_time, created_at)
+                 VALUES ('risa', 'sess-risa', 'claude', ?, 'tool:Bash', ?, 1)",
+                    rusqlite::params![state, old],
+                )
+                .unwrap();
+            db.set_session_binding("sess-risa", "risa").unwrap();
+
+            let before = db.get_instance_full("risa").unwrap().unwrap();
+            let computed = get_instance_status(&before, &db);
+            assert_eq!(computed.status, ST_INACTIVE);
+            assert_eq!(computed.context, "stale");
+            assert!(computed.age_seconds >= 7200);
+            assert_eq!(cleanup_stale_instances(&db, 3600, 3600), 0, "{state}");
+            let after = db.get_instance_full("risa").unwrap().unwrap();
+            assert_eq!(after.status_time, old, "retention must not fake freshness");
+            assert_eq!(after.status, state);
+            assert_eq!(
+                db.get_session_binding("sess-risa").unwrap().as_deref(),
+                Some("risa")
+            );
+            cleanup(path);
+        }
+    }
+
+    #[test]
+    fn cleanup_stale_preservation_requires_exact_hook_only_claude_binding() {
+        crate::config::Config::init();
+        for case in ["unbound", "wrong-owner", "process-bound", "different-tool"] {
+            let (db, path) = setup_test_db();
+            let old = now_epoch_i64() - 7200;
+            let tool = if case == "different-tool" {
+                "codex"
+            } else {
+                "claude"
+            };
+            db.conn()
+                .execute(
+                    "INSERT INTO instances
+                 (name, session_id, tool, status, status_context, status_time, created_at)
+                 VALUES ('risa', 'sess-risa', ?, 'active', 'tool:Bash', ?, 1)",
+                    rusqlite::params![tool, old],
+                )
+                .unwrap();
+            if case == "wrong-owner" {
+                let now = now_epoch_i64();
+                db.conn()
+                    .execute(
+                        "INSERT INTO instances
+                     (name, session_id, tool, status, status_time, created_at)
+                     VALUES ('other', 'sess-other', 'claude', 'active', ?1, ?1)",
+                        rusqlite::params![now],
+                    )
+                    .unwrap();
+                db.set_session_binding("sess-risa", "other").unwrap();
+            } else if case != "unbound" {
+                db.set_session_binding("sess-risa", "risa").unwrap();
+            }
+            if case == "process-bound" {
+                db.set_process_binding("proc-risa", "sess-risa", "risa")
+                    .unwrap();
+            }
+            assert_eq!(cleanup_stale_instances(&db, 3600, 3600), 1, "{case}");
+            assert!(db.get_instance_full("risa").unwrap().is_none(), "{case}");
+            cleanup(path);
+        }
+    }
+
+    #[test]
+    fn cleanup_still_removes_explicitly_stopped_hook_only_claude() {
+        crate::config::Config::init();
+        for context in [
+            "exit:killed",
+            "exit:closed",
+            "exit:interrupted",
+            "exit:session_switch",
+        ] {
+            let (db, path) = setup_test_db();
+            let old = now_epoch_i64() - 120;
+            db.conn()
+                .execute(
+                    "INSERT INTO instances
+                 (name, session_id, tool, status, status_context, status_time, created_at)
+                 VALUES ('risa', 'sess-risa', 'claude', 'inactive', ?, ?, 1)",
+                    rusqlite::params![context, old],
+                )
+                .unwrap();
+            db.set_session_binding("sess-risa", "risa").unwrap();
+            assert_eq!(cleanup_stale_instances(&db, 3600, 3600), 1, "{context}");
+            assert!(db.get_instance_full("risa").unwrap().is_none());
+            cleanup(path);
+        }
     }
 }

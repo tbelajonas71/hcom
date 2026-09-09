@@ -63,6 +63,20 @@ run `hcom --help` for full command syntax and flags.
 
 session binding (hcom transcript, hcom r/f by session id) happens on first message or first prompt for all hcom-launched tools.
 
+for an existing top-level Codex Desktop task, bind its stable identity from the owning project directory:
+
+```bash
+hcom start --as <name>
+```
+
+if that same stopped Codex identity is pinned to an old directory, move it only from the owning task in the new directory:
+
+```bash
+hcom start --as <name> --relocate
+```
+
+`--relocate` requires `--as` and refuses live identities, child tasks, platform changes, session mismatches and same-directory moves. never edit the hcom database or invent a temporary identity. after relocation, cross a normal app hook boundary and verify the same session, tool, directory and `hooks_bound: true` with `hcom list <name> --json`.
+
 ---
 
 ## setup

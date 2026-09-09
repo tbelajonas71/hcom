@@ -115,6 +115,22 @@ Hooks go into config dirs under `~/` (or `HCOM_DIR`) on first run. If you aren't
 
 Any other AI tool without hooks can join by running `hcom start`. Any process can wake agents with `hcom send`.
 
+### Bind an existing app session
+
+Run this from the project directory inside the top-level Codex Desktop task that owns the identity:
+
+```bash
+hcom start --as <name>
+```
+
+If that same stopped Codex identity was previously bound to a different project directory, use the explicit relocation path:
+
+```bash
+hcom start --as <name> --relocate
+```
+
+`--relocate` is intentionally narrow: it requires `--as`, works only from the owning top-level Codex Desktop task, refuses live targets, child tasks, platform changes, session mismatches and same-directory moves, and preserves the existing identity and unread-message cursor. Do not edit the hcom database or create a temporary identity to move a task. After relocation, cross one ordinary app hook boundary and verify `hcom list <name> --json` still reports the same session, tool, directory and `hooks_bound: true`.
+
 ---
 
 ## Terminal

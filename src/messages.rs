@@ -214,8 +214,9 @@ fn build_unmatched_error(unmatched: &[String], full_names: &[String]) -> String 
 /// Resolution order:
 /// 1. Exact base name
 /// 2. Exact full display name ({tag}-{name})
-/// 3. Exact tag group when the target ends in `-`
-/// 4. Unique remote prefix when the target contains `:`
+/// 3. Unique exact tag alias for a bare role name
+/// 4. Exact tag group when the target ends in `-`
+/// 5. Unique remote prefix when the target contains `:`
 ///
 /// Special case: bigboss:SUFFIX resolves to bigboss (virtual identity, device-agnostic).
 fn match_target(target: &str, instances: &[InstanceInfo]) -> Result<Vec<String>, String> {
@@ -243,6 +244,35 @@ fn match_target(target: &str, instances: &[InstanceInfo]) -> Result<Vec<String>,
         .collect();
     if !exact_full.is_empty() {
         return Ok(dedup_preserving_order(&exact_full));
+    }
+
+    // A bare role name resolves to its one live tagged instance.  The
+    // trailing-dash form remains the explicit group/fan-out syntax.
+    if !target.ends_with('-') && !target.contains(':') {
+        let exact_tag: Vec<String> = instances
+            .iter()
+            .filter(|inst| !inst.name.contains(':'))
+            .filter(|inst| {
+                inst.tag
+                    .as_deref()
+                    .is_some_and(|tag| tag.eq_ignore_ascii_case(target))
+            })
+            .map(|inst| inst.name.clone())
+            .collect();
+        let exact_tag = dedup_preserving_order(&exact_tag);
+        if exact_tag.len() == 1 {
+            return Ok(exact_tag);
+        }
+        if exact_tag.len() > 1 {
+            return Err(format!(
+                "Ambiguous role alias @{target}; matches: {}. Use an exact instance name, or @{target}- for the whole role group.",
+                exact_tag
+                    .iter()
+                    .map(|name| format!("@{name}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
     }
 
     if let Some(tag_target) = target.strip_suffix('-') {
@@ -1016,6 +1046,26 @@ mod tests {
         assert!(result.contains(&"luna".to_string()));
         assert!(result.contains(&"nova".to_string()));
         assert!(!result.contains(&"kira".to_string()));
+    }
+
+    #[test]
+    fn test_match_target_unique_role_alias() {
+        let instances = make_instances(&[("moka", Some("rpg-social")), ("luna", None)]);
+        assert_eq!(
+            match_target("rpg-social", &instances).unwrap(),
+            vec!["moka"]
+        );
+    }
+
+    #[test]
+    fn test_match_target_ambiguous_role_alias_fails_closed() {
+        let instances =
+            make_instances(&[("moka", Some("rpg-social")), ("luna", Some("rpg-social"))]);
+        let err = match_target("rpg-social", &instances).unwrap_err();
+        assert!(err.contains("Ambiguous role alias @rpg-social"));
+        assert!(err.contains("@moka"));
+        assert!(err.contains("@luna"));
+        assert!(err.contains("@rpg-social-"));
     }
 
     #[test]

@@ -402,6 +402,16 @@ pub fn send_message(
     validate_message(message)?;
 
     let delivery = resolve_delivery(db, identity, message, envelope, explicit_targets)?;
+    if envelope
+        .and_then(|env| env.intent.as_ref())
+        .is_some_and(|intent| intent.as_str() == "request")
+        && delivery.delivered_to.len() != 1
+    {
+        return Err(format!(
+            "Intent 'request' requires exactly one recipient; resolved {}. Use --intent inform for fan-out.",
+            delivery.delivered_to.len()
+        ));
+    }
     let scope_str = delivery.effective_scope.as_str();
 
     // Build event data
@@ -1646,6 +1656,61 @@ mod tests {
             .unwrap();
         assert_eq!(scope, "mentions");
         assert!(mentions_json.contains("nova"));
+
+        cleanup_test_db(path);
+    }
+
+    #[test]
+    #[serial]
+    fn send_message_request_fanout_fails_before_event_or_watch_creation() {
+        let (db, path, _env) = setup_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, created_at) VALUES ('luna', 1000.0), ('nova', 1000.0), ('miso', 1000.0)",
+                [],
+            )
+            .unwrap();
+
+        let sender = SenderIdentity {
+            kind: SenderKind::Instance,
+            name: "luna".into(),
+            instance_data: None,
+            session_id: None,
+        };
+        let envelope = MessageEnvelope {
+            intent: Some(crate::messages::MessageIntent::Request),
+            ..Default::default()
+        };
+
+        let before_events: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+            .unwrap();
+        let err = send_message(
+            &db,
+            &sender,
+            "status?",
+            Some(&envelope),
+            Some(&["nova".to_string(), "miso".to_string()]),
+        )
+        .unwrap_err();
+        assert!(err.contains("requires exactly one recipient"));
+        assert!(err.contains("resolved 2"));
+
+        let after_events: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(after_events, before_events);
+        let reqwatch_count: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM kv WHERE key LIKE 'events_sub:reqwatch-%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(reqwatch_count, 0);
 
         cleanup_test_db(path);
     }

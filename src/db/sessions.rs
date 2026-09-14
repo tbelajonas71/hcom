@@ -433,6 +433,20 @@ impl HcomDb {
             .is_ok()
     }
 
+    /// Number of session bindings owned by an instance (0 on error).
+    pub fn session_binding_count_for_instance(&self, instance_name: &str) -> i64 {
+        if instance_name.is_empty() {
+            return 0;
+        }
+        self.conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_bindings WHERE instance_name = ?",
+                params![instance_name],
+                |row| row.get(0),
+            )
+            .unwrap_or(0)
+    }
+
     /// Check if instance has a process binding (hcom-launched).
     pub fn has_process_binding_for_instance(&self, instance_name: &str) -> bool {
         if instance_name.is_empty() {

@@ -87,6 +87,44 @@ pub(crate) fn is_hook_only_claude_session(data: &InstanceRow, db: &HcomDb) -> bo
     })
 }
 
+/// Whether this row represents a Codex desktop-app conversation that hcom did
+/// not spawn and that can only receive messages at Codex hook boundaries.
+///
+/// Every hcom Codex launch leaves a durable spawn mark on the row: the launcher
+/// binds `HCOM_PROCESS_ID` (process binding) and always writes `launch_args`
+/// (a JSON array, `"[]"` when empty); background launches also record `pid`
+/// and `background`. A Codex app thread has none of these, and its native
+/// SessionStart binds exactly one session (the app thread id) to the row.
+/// Remote rows belong to their origin device.
+pub(crate) fn is_hook_only_codex_app_session(data: &InstanceRow, db: &HcomDb) -> bool {
+    if data.tool != "codex"
+        || data
+            .origin_device_id
+            .as_deref()
+            .is_some_and(|device_id| !device_id.is_empty())
+        || data.pid.is_some()
+        || data.launch_args.is_some()
+        || data.background != 0
+        || db.has_process_binding_for_instance(&data.name)
+    {
+        return false;
+    }
+
+    data.session_id.as_deref().is_some_and(|session_id| {
+        matches!(
+            db.get_session_binding(session_id),
+            Ok(Some(owner)) if owner == data.name
+        )
+    }) && db.session_binding_count_for_instance(&data.name) == 1
+}
+
+/// Hook-only app session whose silence between hook boundaries is not a
+/// session stop: Claude Desktop or the Codex desktop app, each under its own
+/// exact ownership test.
+pub(crate) fn is_hook_only_app_session(data: &InstanceRow, db: &HcomDb) -> bool {
+    is_hook_only_claude_session(data, db) || is_hook_only_codex_app_session(data, db)
+}
+
 // Tracks wall-clock vs monotonic-clock drift to detect system sleep.
 // On macOS, Instant (mach_absolute_time) does not advance during sleep,
 // but SystemTime (gettimeofday) does. Large drift means the system just woke.
@@ -788,11 +826,13 @@ pub fn cleanup_stale_instances(
             // Silence between app hook boundaries is not a session stop.
             // It can be stored as inactive/exit:timeout OR computed as stale
             // from an old active/listening/blocked row. Retain the exact
-            // hook-only binding and pending queue for both cases. Do not
-            // refresh timestamps or report the session alive: computed status
-            // stays stale. Explicit stops/end and non-hook ownership continue
+            // hook-only binding and pending queue for both cases, for Claude
+            // Desktop and for Codex desktop-app threads. Do not refresh
+            // timestamps or report the session alive: computed status stays
+            // stale. Explicit stops/end, hcom-spawned (process-bound, pid,
+            // launch_args, background) and non-hook ownership continue
             // through the existing cleanup paths.
-            if is_hook_only_claude_session(data, db)
+            if is_hook_only_app_session(data, db)
                 && (computed.context == "stale"
                     || (data.status == ST_INACTIVE && data.status_context == "exit:timeout"))
             {
@@ -1776,8 +1816,11 @@ WARNING: proceeding, even though we could not update PATH: Operation not permitt
         for case in ["unbound", "wrong-owner", "process-bound", "different-tool"] {
             let (db, path) = setup_test_db();
             let old = now_epoch_i64() - 7200;
+            // A tool with no hook-only app exemption. (Before 2026-09-14 this
+            // case used "codex"; a bound, unspawned Codex row is now the Codex
+            // desktop-app shape and is retained, see the codex_app tests.)
             let tool = if case == "different-tool" {
-                "codex"
+                "gemini"
             } else {
                 "claude"
             };
@@ -1835,6 +1878,175 @@ WARNING: proceeding, even though we could not update PATH: Operation not permitt
             db.set_session_binding("sess-risa", "risa").unwrap();
             assert_eq!(cleanup_stale_instances(&db, 3600, 3600), 1, "{context}");
             assert!(db.get_instance_full("risa").unwrap().is_none());
+            cleanup(path);
+        }
+    }
+
+    /// Insert a row shaped like a Codex desktop-app conversation as the Codex
+    /// hooks leave it: tool codex, no pid, no launch_args, not background,
+    /// local. Binding is added by the caller.
+    fn insert_codex_app_row(db: &HcomDb, status: &str, context: &str, status_time: i64) {
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                 (name, session_id, tool, status, status_context, status_time, last_stop,
+                  created_at, background)
+                 VALUES ('gmc', 'thread-gmc', 'codex', ?1, ?2, ?3, ?3, 1, 0)",
+                rusqlite::params![status, context, status_time],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn cleanup_preserves_bound_hook_only_codex_app_timeout() {
+        crate::config::Config::init();
+        let (db, path) = setup_test_db();
+        let old = now_epoch_i64() - 120;
+        insert_codex_app_row(&db, ST_INACTIVE, "exit:timeout", old);
+        db.set_session_binding("thread-gmc", "gmc").unwrap();
+
+        assert_eq!(cleanup_stale_instances(&db, 3600, 3600), 0);
+        assert!(db.get_instance_full("gmc").unwrap().is_some());
+        assert_eq!(
+            db.get_session_binding("thread-gmc").unwrap().as_deref(),
+            Some("gmc")
+        );
+
+        cleanup(path);
+    }
+
+    #[test]
+    fn cleanup_preserves_bound_hook_only_codex_app_stale_states() {
+        crate::config::Config::init();
+        // 3613 s reproduces image-media-studio 2026-09-14: listening at
+        // 01:17:06Z, stale_cleanup at 02:17:19Z (event 164567).
+        for (state, age) in [
+            (ST_LISTENING, 3613),
+            (ST_LISTENING, 7200),
+            (ST_ACTIVE, 7200),
+            (ST_BLOCKED, 7200),
+        ] {
+            let (db, path) = setup_test_db();
+            let old = now_epoch_i64() - age;
+            let context = if state == ST_LISTENING {
+                ""
+            } else {
+                "tool:Bash"
+            };
+            insert_codex_app_row(&db, state, context, old);
+            db.set_session_binding("thread-gmc", "gmc").unwrap();
+
+            let before = db.get_instance_full("gmc").unwrap().unwrap();
+            let computed = get_instance_status(&before, &db);
+            assert_eq!(computed.status, ST_INACTIVE, "{state}");
+            assert_eq!(computed.context, "stale", "{state}");
+            assert!(computed.age_seconds > 3600, "{state}");
+            assert_eq!(cleanup_stale_instances(&db, 3600, 3600), 0, "{state}");
+            let after = db.get_instance_full("gmc").unwrap().unwrap();
+            assert_eq!(after.status_time, old, "retention must not fake freshness");
+            assert_eq!(after.last_stop, old, "retention must not fake a heartbeat");
+            assert_eq!(after.status, state);
+            assert_eq!(
+                get_instance_status(&after, &db).context,
+                "stale",
+                "computed status must stay stale"
+            );
+            assert_eq!(
+                db.get_session_binding("thread-gmc").unwrap().as_deref(),
+                Some("gmc")
+            );
+            cleanup(path);
+        }
+    }
+
+    #[test]
+    fn cleanup_stale_preservation_requires_exact_hook_only_codex_app_binding() {
+        crate::config::Config::init();
+        for case in [
+            "unbound",
+            "wrong-owner",
+            "process-bound",
+            "hcom-launched-pid",
+            "hcom-launched-args",
+            "hcom-launched-background",
+            "second-session-binding",
+            "different-tool",
+        ] {
+            let (db, path) = setup_test_db();
+            let old = now_epoch_i64() - 7200;
+            insert_codex_app_row(&db, ST_ACTIVE, "tool:Bash", old);
+            match case {
+                "hcom-launched-pid" => {
+                    db.conn()
+                        .execute("UPDATE instances SET pid = 4242 WHERE name = 'gmc'", [])
+                        .unwrap();
+                }
+                "hcom-launched-args" => {
+                    db.conn()
+                        .execute(
+                            "UPDATE instances SET launch_args = '[]' WHERE name = 'gmc'",
+                            [],
+                        )
+                        .unwrap();
+                }
+                "hcom-launched-background" => {
+                    db.conn()
+                        .execute("UPDATE instances SET background = 1 WHERE name = 'gmc'", [])
+                        .unwrap();
+                }
+                "different-tool" => {
+                    db.conn()
+                        .execute(
+                            "UPDATE instances SET tool = 'gemini' WHERE name = 'gmc'",
+                            [],
+                        )
+                        .unwrap();
+                }
+                _ => {}
+            }
+            if case == "wrong-owner" {
+                let now = now_epoch_i64();
+                db.conn()
+                    .execute(
+                        "INSERT INTO instances
+                     (name, session_id, tool, status, status_time, created_at)
+                     VALUES ('other', 'thread-other', 'codex', 'active', ?1, ?1)",
+                        rusqlite::params![now],
+                    )
+                    .unwrap();
+                db.set_session_binding("thread-gmc", "other").unwrap();
+            } else if case != "unbound" {
+                db.set_session_binding("thread-gmc", "gmc").unwrap();
+            }
+            if case == "process-bound" {
+                // hcom-spawned Codex PTY/headless: the launcher binds the process.
+                db.set_process_binding("proc-gmc", "thread-gmc", "gmc")
+                    .unwrap();
+            }
+            if case == "second-session-binding" {
+                db.set_session_binding("thread-gmc-older", "gmc").unwrap();
+            }
+            assert_eq!(cleanup_stale_instances(&db, 3600, 3600), 1, "{case}");
+            assert!(db.get_instance_full("gmc").unwrap().is_none(), "{case}");
+            cleanup(path);
+        }
+    }
+
+    #[test]
+    fn cleanup_still_removes_explicitly_stopped_hook_only_codex_app() {
+        crate::config::Config::init();
+        for context in [
+            "exit:killed",
+            "exit:closed",
+            "exit:interrupted",
+            "exit:session_switch",
+        ] {
+            let (db, path) = setup_test_db();
+            let old = now_epoch_i64() - 120;
+            insert_codex_app_row(&db, ST_INACTIVE, context, old);
+            db.set_session_binding("thread-gmc", "gmc").unwrap();
+            assert_eq!(cleanup_stale_instances(&db, 3600, 3600), 1, "{context}");
+            assert!(db.get_instance_full("gmc").unwrap().is_none(), "{context}");
             cleanup(path);
         }
     }

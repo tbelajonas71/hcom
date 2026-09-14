@@ -268,6 +268,29 @@ fn deliverable_instances(db: &HcomDb) -> Result<Vec<InstanceInfo>, String> {
                            WHERE pb.instance_name = i.name
                        )
                    )
+                   -- Mirrors instance_lifecycle::is_hook_only_codex_app_session.
+                   OR (
+                       i.status = 'inactive'
+                       AND i.status_context = 'exit:timeout'
+                       AND i.tool = 'codex'
+                       AND COALESCE(i.origin_device_id, '') = ''
+                       AND i.pid IS NULL
+                       AND COALESCE(i.launch_args, '') = ''
+                       AND COALESCE(i.background, 0) = 0
+                       AND EXISTS (
+                           SELECT 1 FROM session_bindings sb
+                           WHERE sb.instance_name = i.name
+                             AND sb.session_id = i.session_id
+                       )
+                       AND (
+                           SELECT COUNT(*) FROM session_bindings sb
+                           WHERE sb.instance_name = i.name
+                       ) = 1
+                       AND NOT EXISTS (
+                           SELECT 1 FROM process_bindings pb
+                           WHERE pb.instance_name = i.name
+                       )
+                   )
                )",
         )
         .map_err(|e| format!("DB error: {e}"))?
@@ -1895,6 +1918,148 @@ mod tests {
         );
         assert_eq!(db.get_unread_messages("risa").len(), 1);
         cleanup_test_db(path);
+    }
+
+    #[test]
+    #[serial]
+    fn send_mention_survives_cleanup_for_stale_hook_only_codex_app() {
+        // image-media-studio 2026-09-14: a Codex desktop-app conversation
+        // (hooks only, no process binding) stored 'listening' was reaped by
+        // stale_cleanup after 3600 s, after which sends were refused.
+        let (db, path, _env) = setup_test_db();
+        let now = crate::shared::time::now_epoch_i64();
+        let old = now - 3613;
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+             (name, session_id, tool, status, status_context, status_time, last_stop,
+              created_at, last_event_id)
+             VALUES ('luna', 'sess-luna', 'claude', 'active', '', ?1, ?1, ?1, 0),
+                    ('gmc', 'thread-gmc', 'codex', 'listening', '', ?2, ?2, 1, 0)",
+                rusqlite::params![now, old],
+            )
+            .unwrap();
+        db.set_session_binding("thread-gmc", "gmc").unwrap();
+        let sender = SenderIdentity {
+            kind: SenderKind::Instance,
+            name: "luna".into(),
+            instance_data: None,
+            session_id: Some("sess-luna".into()),
+        };
+        assert_eq!(
+            crate::instance_lifecycle::cleanup_stale_instances(&db, 3600, 3600),
+            0
+        );
+        let queued = send_message(
+            &db,
+            &sender,
+            "retained-stale-codex-app",
+            None,
+            Some(&["gmc".to_string()]),
+        )
+        .unwrap();
+        assert_eq!(queued, vec!["gmc".to_string()]);
+        let unread = db.get_unread_messages("gmc");
+        assert_eq!(unread.len(), 1);
+        assert_eq!(unread[0].text, "retained-stale-codex-app");
+        assert_eq!(db.get_cursor("gmc"), 0, "queued is not read");
+        assert_eq!(
+            crate::instance_lifecycle::cleanup_stale_instances(&db, 3600, 3600),
+            0
+        );
+        assert_eq!(db.get_unread_messages("gmc").len(), 1, "queue retained");
+        cleanup_test_db(path);
+    }
+
+    #[test]
+    #[serial]
+    fn send_mention_queues_for_hook_only_codex_app_timeout() {
+        let (db, path, _env) = setup_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                 (name, session_id, tool, status, status_context, created_at, last_event_id)
+                 VALUES ('luna', 'sess-luna', 'claude', 'listening', '', 1000.0, 0),
+                        ('gmc', 'thread-gmc', 'codex', 'inactive', 'exit:timeout', 1000.0, 0)",
+                [],
+            )
+            .unwrap();
+        db.set_session_binding("thread-gmc", "gmc").unwrap();
+
+        let sender = SenderIdentity {
+            kind: SenderKind::Instance,
+            name: "luna".into(),
+            instance_data: None,
+            session_id: Some("sess-luna".into()),
+        };
+
+        let delivered =
+            send_message(&db, &sender, "queued", None, Some(&["gmc".to_string()])).unwrap();
+        assert_eq!(delivered, vec!["gmc".to_string()]);
+        assert_eq!(db.get_unread_messages("gmc").len(), 1);
+        assert_eq!(db.get_cursor("gmc"), 0, "send must not consume the queue");
+
+        cleanup_test_db(path);
+    }
+
+    #[test]
+    #[serial]
+    fn send_mention_excludes_hcom_launched_codex_timeout() {
+        let sender = SenderIdentity {
+            kind: SenderKind::Instance,
+            name: "luna".into(),
+            instance_data: None,
+            session_id: Some("sess-luna".into()),
+        };
+        for case in [
+            "unbound",
+            "process-bound",
+            "pid",
+            "launch-args",
+            "background",
+        ] {
+            let (db, path, _env) = setup_test_db();
+            db.conn()
+                .execute(
+                    "INSERT INTO instances
+                     (name, session_id, tool, status, status_context, created_at)
+                     VALUES ('luna', 'sess-luna', 'claude', 'listening', '', 1000.0),
+                            ('gmc', 'thread-gmc', 'codex', 'inactive', 'exit:timeout', 1000.0)",
+                    [],
+                )
+                .unwrap();
+            if case != "unbound" {
+                db.set_session_binding("thread-gmc", "gmc").unwrap();
+            }
+            match case {
+                "process-bound" => db
+                    .set_process_binding("proc-gmc", "thread-gmc", "gmc")
+                    .unwrap(),
+                "pid" => {
+                    db.conn()
+                        .execute("UPDATE instances SET pid = 4242 WHERE name = 'gmc'", [])
+                        .unwrap();
+                }
+                "launch-args" => {
+                    db.conn()
+                        .execute(
+                            "UPDATE instances SET launch_args = '[]' WHERE name = 'gmc'",
+                            [],
+                        )
+                        .unwrap();
+                }
+                "background" => {
+                    db.conn()
+                        .execute("UPDATE instances SET background = 1 WHERE name = 'gmc'", [])
+                        .unwrap();
+                }
+                _ => {}
+            }
+            let err =
+                send_message(&db, &sender, "ping", None, Some(&["gmc".to_string()])).unwrap_err();
+            assert!(err.contains("@gmc"), "{case}: err={err}");
+            cleanup_test_db(path);
+        }
     }
 
     #[test]

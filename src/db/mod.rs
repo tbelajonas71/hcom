@@ -364,6 +364,13 @@ impl HcomDb {
             CREATE INDEX IF NOT EXISTS idx_type ON events(type);
             CREATE INDEX IF NOT EXISTS idx_instance ON events(instance);
             CREATE INDEX IF NOT EXISTS idx_type_instance ON events(type, instance);
+            -- Collision subscriptions correlate file-write status events by detail.
+            -- Without this expression index every subscribed agent scans the full
+            -- status history for each imported relay edit event.
+            CREATE INDEX IF NOT EXISTS idx_status_detail_instance_timestamp
+                ON events(json_extract(data, '$.detail'), instance, timestamp,
+                          json_extract(data, '$.context'))
+                WHERE type = 'status';
 
             -- Instance indexes
             CREATE INDEX IF NOT EXISTS idx_session_id ON instances(session_id);
@@ -1231,6 +1238,24 @@ pub(super) mod tests {
             .conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='view' AND name='events_v'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn test_init_db_creates_status_detail_collision_index() {
+        let (db, db_path) = setup_full_test_db();
+
+        let count: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type='index' AND name='idx_status_detail_instance_timestamp'",
                 [],
                 |row| row.get(0),
             )

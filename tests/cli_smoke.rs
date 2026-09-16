@@ -554,6 +554,91 @@ fn start_as_relocate_routes_cli_and_binds_exact_codex_session() {
 }
 
 #[test]
+fn start_as_relocate_recovers_stopped_codex_snapshot_without_transcript_path() {
+    let h = Hcom::new();
+    let session_id = "thread-cli-relocate-transcriptless";
+    let old_directory = h.workspace.join("old-scaffold-transcriptless");
+    let new_directory = h.workspace.join("cultivation-transcriptless");
+    fs::create_dir_all(&old_directory).unwrap();
+    fs::create_dir_all(&new_directory).unwrap();
+    let sessions = h.codex_home.join("sessions/2026/09/02");
+    fs::create_dir_all(&sessions).unwrap();
+    let transcript = sessions.join(format!("rollout-test-{session_id}.jsonl"));
+    let meta = serde_json::json!({
+        "type": "session_meta",
+        "payload": {
+            "id": session_id,
+            "session_id": session_id,
+            "cwd": old_directory,
+            "originator": "Codex Desktop",
+            "source": "vscode",
+            "thread_source": "user"
+        }
+    });
+    fs::write(&transcript, format!("{meta}\n")).unwrap();
+
+    let (status_code, _, status_error) = h.run(["status", "--json"]);
+    assert_eq!(status_code, 0, "schema init failed: {status_error}");
+    let db = rusqlite::Connection::open(h.hcom_dir.join("hcom.db")).unwrap();
+    let stopped = serde_json::json!({
+        "action": "stopped",
+        "snapshot": {
+            "tool": "codex",
+            "directory": old_directory,
+            "session_id": session_id,
+            "parent_name": null,
+            "parent_session_id": null,
+            "agent_id": null,
+            "origin_device_id": null,
+            "background": 0,
+            "last_event_id": 48
+        }
+    });
+    db.execute(
+        "INSERT INTO events (timestamp, type, instance, data)
+         VALUES ('2026-09-02T00:00:00Z', 'life', 'cultivation', ?1)",
+        rusqlite::params![stopped.to_string()],
+    )
+    .unwrap();
+    drop(db);
+
+    let mut command = h.cmd();
+    command
+        .current_dir(&new_directory)
+        .env("CODEX_SANDBOX", "1")
+        .env("CODEX_THREAD_ID", session_id)
+        .env("CODEX_SESSION_ID", session_id)
+        .args(["start", "--as", "cultivation", "--relocate"]);
+    let output = command.output().expect("run transcriptless relocation CLI");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "stdout={stdout} stderr={stderr}");
+
+    let db = rusqlite::Connection::open(h.hcom_dir.join("hcom.db")).unwrap();
+    let row: (String, String, String, String, i64) = db
+        .query_row(
+            "SELECT session_id, tool, directory, transcript_path, last_event_id
+             FROM instances WHERE name = 'cultivation'",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(row.0, session_id);
+    assert_eq!(row.1, "codex");
+    assert_eq!(PathBuf::from(row.2), new_directory);
+    assert_eq!(PathBuf::from(row.3), transcript);
+    assert_eq!(row.4, 48);
+}
+
+#[test]
 fn bigboss_send_bypasses_identity_gate() {
     // Wiki contract (messaging.md §@bigboss + reference_send_bigboss_flag memory):
     // `send -b` is sender-as-bigboss and bypasses the identity gate that

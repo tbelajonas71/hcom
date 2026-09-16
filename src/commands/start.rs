@@ -1812,15 +1812,18 @@ fn validate_codex_relocation(
         );
     }
 
-    let snapshot_transcript = snapshot
+    let derived_transcript = crate::hooks::codex::derive_codex_transcript_path(&thread_id)
+        .ok_or_else(|| anyhow::anyhow!("Could not locate the active Codex transcript"))?;
+    if let Some(snapshot_transcript) = snapshot
         .get("transcript_path")
         .and_then(serde_json::Value::as_str)
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| anyhow::anyhow!("Stopped identity '{target_name}' has no transcript"))?;
-    let derived_transcript = crate::hooks::codex::derive_codex_transcript_path(&thread_id)
-        .ok_or_else(|| anyhow::anyhow!("Could not locate the active Codex transcript"))?;
-    if !same_path(snapshot_transcript, &derived_transcript) {
-        bail!("Refusing to relocate '{target_name}': stopped and active transcript paths differ");
+    {
+        if !same_path(snapshot_transcript, &derived_transcript) {
+            bail!(
+                "Refusing to relocate '{target_name}': stopped and active transcript paths differ"
+            );
+        }
     }
     let relocation_sessions_root = std::env::var("CODEX_HOME")
         .ok()
@@ -3664,6 +3667,54 @@ mod tests {
 
     #[test]
     #[serial]
+    fn test_codex_explicit_relocation_recovers_snapshot_without_transcript_path() {
+        let (tmp, _hcom_dir, home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        let session_id = "thread-cultivation-transcriptless";
+        let old_directory = tmp.path().join("old-scaffold");
+        let new_directory = tmp.path().join("cultivation");
+        std::fs::create_dir_all(&old_directory).unwrap();
+        std::fs::create_dir_all(&new_directory).unwrap();
+        let old_directory = old_directory.to_string_lossy().to_string();
+        let new_directory = new_directory.to_string_lossy().to_string();
+        let transcript = write_codex_session_meta(&home, session_id, &old_directory);
+        db.log_event(
+            "life",
+            "cultivation",
+            &serde_json::json!({
+                "action": "stopped",
+                "snapshot": {
+                    "tool": "codex",
+                    "directory": old_directory,
+                    "session_id": session_id,
+                    "parent_name": null,
+                    "parent_session_id": null,
+                    "agent_id": null,
+                    "origin_device_id": null,
+                    "last_event_id": 74
+                }
+            }),
+        )
+        .unwrap();
+        let ctx = make_codex_ctx(Some(session_id), &new_directory);
+
+        assert_eq!(
+            start_rebind_with_options(&db, "cultivation", &ctx, None, true, false, None).unwrap(),
+            0
+        );
+        let row = db.get_instance_full("cultivation").unwrap().unwrap();
+        assert_eq!(row.session_id.as_deref(), Some(session_id));
+        assert_eq!(row.last_event_id, 74);
+        assert!(same_path(&row.directory, &new_directory));
+        assert!(same_path(&row.transcript_path, &transcript));
+        assert_eq!(
+            db.get_session_binding(session_id).unwrap().as_deref(),
+            Some("cultivation")
+        );
+    }
+
+    #[test]
+    #[serial]
     fn test_codex_relocation_binding_failure_rolls_back_instance() {
         let (tmp, _hcom_dir, home, _guard) = crate::hooks::test_helpers::isolated_test_env();
         let db = HcomDb::open().unwrap();
@@ -4737,7 +4788,9 @@ mod tests {
         }
 
         let remaining_endpoints: i64 = connection
-            .query_row("SELECT COUNT(*) FROM notify_endpoints", [], |row| row.get(0))
+            .query_row("SELECT COUNT(*) FROM notify_endpoints", [], |row| {
+                row.get(0)
+            })
             .unwrap();
         assert_eq!(remaining_endpoints, 2);
     }

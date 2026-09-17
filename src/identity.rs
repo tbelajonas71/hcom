@@ -11,8 +11,12 @@ static UUID_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$").unwrap()
 });
 
-/// Valid base instance name: lowercase letters, digits, underscore.
-static BASE_NAME_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[a-z0-9_]+$").unwrap());
+/// Valid base instance name: lowercase letters, digits, underscore, and
+/// single hyphen separators.  Estate role names such as `traveller-corpus`
+/// are registered as base names, so sender resolution must accept the same
+/// syntax as registration.
+static BASE_NAME_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^[a-z0-9_]+(?:-[a-z0-9_]+)*$").unwrap());
 
 /// Dangerous characters for user-provided names (injection prevention).
 static DANGEROUS_CHARS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[|&;$`<>]").unwrap());
@@ -34,7 +38,7 @@ pub fn looks_like_agent_id(name: &str) -> bool {
     name.len() == 7 && name.chars().all(|c| c.is_ascii_hexdigit())
 }
 
-/// Check if name is a valid base instance name (lowercase letters, digits, underscore).
+/// Check if name is a valid base instance name.
 pub fn is_valid_base_name(name: &str) -> bool {
     BASE_NAME_RE.is_match(name)
 }
@@ -42,7 +46,7 @@ pub fn is_valid_base_name(name: &str) -> bool {
 /// Build error message for invalid base instance names.
 pub fn base_name_error(name: &str) -> String {
     format!(
-        "Invalid instance name '{name}'. Use base name only (lowercase letters, numbers, underscore)."
+        "Invalid instance name '{name}'. Use a lowercase base name containing letters, numbers, underscore, or single hyphen separators."
     )
 }
 
@@ -200,15 +204,10 @@ pub fn resolve_display_name_or_stopped(db: &HcomDb, input_name: &str) -> Option<
 /// 2. Agent ID (UUID) lookup -> kind=Instance if found
 /// 3. Error if not found
 pub fn resolve_from_name(db: &HcomDb, name: &str) -> Result<SenderIdentity, HcomError> {
-    let mut resolved_name = name.to_string();
+    let resolved_name = name.to_string();
 
-    // Reject invalid base names, but allow tag-name format (e.g. "team-luna")
     if !looks_like_uuid(name) && !is_valid_base_name(name) {
-        // Try tag-name resolution before rejecting
-        match resolve_display_name(db, name) {
-            Some(base) => resolved_name = base,
-            None => return Err(HcomError::InvalidInput(base_name_error(name))),
-        }
+        return Err(HcomError::InvalidInput(base_name_error(name)));
     }
 
     // 1. Instance name lookup (exact match)
@@ -254,7 +253,33 @@ pub fn resolve_from_name(db: &HcomDb, name: &str) -> Result<SenderIdentity, Hcom
         });
     }
 
-    // 3. Not found
+    // 3. Tagged display-name lookup. Exact base names intentionally win so a
+    // registered estate role such as `traveller-corpus` cannot be mistaken
+    // for tag `traveller` plus instance `corpus`.
+    if let Some(instance_name) = resolve_display_name(db, name)
+        && let Ok(Some(data)) = db.get_instance(&instance_name)
+    {
+        crate::log::log_info(
+            "identity",
+            "resolve_from_name",
+            &format!(
+                "name={}, method=display_name, resolved={}",
+                name, instance_name
+            ),
+        );
+        return Ok(SenderIdentity {
+            kind: SenderKind::Instance,
+            name: instance_name,
+            session_id: data
+                .get("session_id")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string()),
+            instance_data: Some(data),
+        });
+    }
+
+    // 4. Not found
     crate::log::log_info(
         "identity",
         "resolve_from_name.not_found",
@@ -601,8 +626,11 @@ mod tests {
     fn test_is_valid_base_name() {
         assert!(is_valid_base_name("luna"));
         assert!(is_valid_base_name("test_name_123"));
+        assert!(is_valid_base_name("traveller-corpus"));
         assert!(!is_valid_base_name("Luna")); // uppercase
-        assert!(!is_valid_base_name("my-name")); // dash
+        assert!(!is_valid_base_name("-my-name"));
+        assert!(!is_valid_base_name("my-name-"));
+        assert!(!is_valid_base_name("my--name"));
         assert!(!is_valid_base_name("")); // empty
         assert!(!is_valid_base_name("name with space"));
     }
@@ -651,6 +679,16 @@ mod tests {
         let identity = resolve_from_name(&db, "luna").unwrap();
         assert_eq!(identity.name, "luna");
         assert!(matches!(identity.kind, SenderKind::Instance));
+        assert_eq!(identity.session_id.as_deref(), Some("sess-1"));
+    }
+
+    #[test]
+    fn test_resolve_from_name_exact_hyphenated_role() {
+        let (db, _dir) = make_test_db();
+        insert_instance(&db, "traveller-corpus", Some("sess-1"), None);
+
+        let identity = resolve_from_name(&db, "traveller-corpus").unwrap();
+        assert_eq!(identity.name, "traveller-corpus");
         assert_eq!(identity.session_id.as_deref(), Some("sess-1"));
     }
 

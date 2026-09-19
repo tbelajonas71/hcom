@@ -52,7 +52,7 @@ pub fn extract_tool_detail(tool: &str, tool_name: &str, tool_input: &serde_json:
 /// Persist vanilla instance binding (session + transcript + tool).
 ///
 /// Called after marker extraction (each tool extracts differently).
-/// Returns instance_name on success or error, None only if nothing to bind.
+/// Returns instance_name on success and None when the binding could not be persisted.
 ///
 pub fn bind_vanilla_instance(
     db: &HcomDb,
@@ -100,6 +100,7 @@ pub fn bind_vanilla_instance(
             "hook.error",
             &format!("hook={} op=bind_vanilla err={}", hook, e),
         );
+        return None;
     }
 
     Some(instance_name.to_string())
@@ -446,5 +447,23 @@ mod tests {
         assert_eq!(inst.session_id.as_deref(), Some("sess-v2"));
         assert_eq!(inst.transcript_path, "/tmp/t2.jsonl");
         assert_eq!(inst.tool, "codex");
+    }
+
+    #[test]
+    fn test_bind_vanilla_instance_missing_target_does_not_fake_success() {
+        crate::config::Config::init();
+        let (_dir, db) = make_test_db();
+
+        let result = bind_vanilla_instance(
+            &db,
+            "missing",
+            Some("sess-missing"),
+            None,
+            "codex",
+            "SessionStart",
+        );
+
+        assert_eq!(result, None);
+        assert_eq!(db.get_session_binding("sess-missing").unwrap(), None);
     }
 }

@@ -305,6 +305,63 @@ fn start_send_events_roundtrip() {
 }
 
 #[test]
+fn registered_estate_names_work_through_name_send_and_start() {
+    let h = Hcom::new();
+    let registered = ["HCC-OriginPC", "LCC-Laptop:HIHO", "realms-unbound"];
+
+    // Create ordinary hermetic instances, then give them the exact registered
+    // estate names. This exercises the real binary and isolated SQLite store;
+    // it never touches the live hcom binary or live registration database.
+    let generated: Vec<String> = registered.iter().map(|_| h.start()).collect();
+    let db = rusqlite::Connection::open(h.hcom_dir.join("hcom.db")).unwrap();
+    for (old, new) in generated.iter().zip(registered) {
+        db.execute(
+            "UPDATE instances SET name = ?1 WHERE name = ?2",
+            rusqlite::params![new, old],
+        )
+        .unwrap();
+    }
+    drop(db);
+
+    // --name and send must resolve each exact registered identity before
+    // applying lowercase/ad-hoc validation or tag parsing.
+    for (sender, recipient) in [
+        ("HCC-OriginPC", "realms-unbound"),
+        ("LCC-Laptop:HIHO", "HCC-OriginPC"),
+        ("realms-unbound", "LCC-Laptop:HIHO"),
+    ] {
+        let (code, stdout, stderr) = h.run([
+            "send",
+            "--name",
+            sender,
+            &format!("@{recipient}"),
+            "--",
+            "mixed-case identity regression",
+        ]);
+        assert_eq!(code, 0, "sender={sender} stdout={stdout} stderr={stderr}");
+    }
+
+    // The same exact names must survive the normal stop/reclaim CLI path.
+    for name in registered {
+        let (stop_code, stop_stdout, stop_stderr) = h.run(["stop", name]);
+        assert_eq!(
+            stop_code, 0,
+            "stop name={name} stdout={stop_stdout} stderr={stop_stderr}"
+        );
+
+        let (start_code, start_stdout, start_stderr) = h.run(["start", "--as", name]);
+        assert_eq!(
+            start_code, 0,
+            "start name={name} stdout={start_stdout} stderr={start_stderr}"
+        );
+        assert!(
+            start_stdout.contains(&format!("[hcom:{name}]")),
+            "start marker missing for {name}: stdout={start_stdout}"
+        );
+    }
+}
+
+#[test]
 fn intent_and_reply_to_roundtrip() {
     // Wiki contract (messaging.md §Intent + event-model.md `msg_intent`/`reply_to_local`):
     // request → ack with --reply-to flattens through `events_v` so threads/replies

@@ -206,11 +206,11 @@ pub fn resolve_display_name_or_stopped(db: &HcomDb, input_name: &str) -> Option<
 pub fn resolve_from_name(db: &HcomDb, name: &str) -> Result<SenderIdentity, HcomError> {
     let resolved_name = name.to_string();
 
-    if !looks_like_uuid(name) && !is_valid_base_name(name) {
-        return Err(HcomError::InvalidInput(base_name_error(name)));
-    }
-
-    // 1. Instance name lookup (exact match)
+    // 1. Instance name lookup (exact match). Registered identities are
+    // authoritative and may use estate-prescribed casing, hyphens, or a
+    // remote-device suffix (for example `HCC-OriginPC` or
+    // `LCC-Laptop:HIHO`). Do this before applying the conservative syntax
+    // rule for unknown/ad-hoc names, and before tagged display-name parsing.
     if let Ok(Some(data)) = db.get_instance(&resolved_name) {
         crate::log::log_info(
             "identity",
@@ -227,6 +227,10 @@ pub fn resolve_from_name(db: &HcomDb, name: &str) -> Result<SenderIdentity, Hcom
                 .map(|s| s.to_string()),
             instance_data: Some(data),
         });
+    }
+
+    if !looks_like_uuid(name) && !is_valid_base_name(name) {
+        return Err(HcomError::InvalidInput(base_name_error(name)));
     }
 
     // 2. Agent ID lookup (Claude Code sends short IDs like 'a6d9caf')
@@ -690,6 +694,22 @@ mod tests {
         let identity = resolve_from_name(&db, "traveller-corpus").unwrap();
         assert_eq!(identity.name, "traveller-corpus");
         assert_eq!(identity.session_id.as_deref(), Some("sess-1"));
+    }
+
+    #[test]
+    fn test_resolve_from_name_exact_registered_estate_names_bypass_adhoc_syntax() {
+        let (db, _dir) = make_test_db();
+        for (index, name) in ["HCC-OriginPC", "LCC-Laptop:HIHO", "realms-unbound"]
+            .into_iter()
+            .enumerate()
+        {
+            let session_id = format!("sess-{index}");
+            insert_instance(&db, name, Some(&session_id), None);
+
+            let identity = resolve_from_name(&db, name).unwrap();
+            assert_eq!(identity.name, name);
+            assert_eq!(identity.session_id.as_deref(), Some(session_id.as_str()));
+        }
     }
 
     #[test]

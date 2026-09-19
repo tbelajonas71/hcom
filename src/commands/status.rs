@@ -170,22 +170,17 @@ fn get_agent_counts(db: &HcomDb) -> AgentCounts {
         total: 0,
     };
 
-    if let Ok(mut stmt) = db
-        .conn()
-        .prepare("SELECT status, COUNT(*) FROM instances GROUP BY status")
-        && let Ok(rows) = stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-        })
-    {
-        for row in rows.flatten() {
-            match row.0.as_str() {
-                s if s.starts_with("active") => c.active += row.1,
-                "listening" => c.listening += row.1,
-                s if s.starts_with("blocked") => c.blocked += row.1,
-                "error" => c.error += row.1,
-                "launching" => c.launching += row.1,
-                "inactive" => c.inactive += row.1,
-                _ => c.inactive += row.1,
+    if let Ok(instances) = db.iter_instances_full() {
+        for instance in instances {
+            let status = crate::instance_lifecycle::get_instance_status(&instance, db).status;
+            match status.as_str() {
+                s if s.starts_with("active") => c.active += 1,
+                "listening" => c.listening += 1,
+                s if s.starts_with("blocked") => c.blocked += 1,
+                "error" => c.error += 1,
+                "launching" => c.launching += 1,
+                "inactive" => c.inactive += 1,
+                _ => c.inactive += 1,
             }
         }
     }
@@ -731,5 +726,27 @@ mod tests {
             crate::router::resolve_effective_dev_root(&dir.path().join("hcom.db")),
             Some((std::path::PathBuf::from("/tmp/dev-root"), "kv"))
         );
+    }
+
+    #[test]
+    fn test_agent_counts_use_runtime_stale_detection() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::HcomDb::open_at(&dir.path().join("hcom.db")).unwrap();
+        let stale = crate::shared::time::now_epoch_i64()
+            - crate::instance_lifecycle::STATUS_ACTIVITY_TIMEOUT
+            - 1;
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                 (name, status, status_time, created_at, tool)
+                 VALUES ('stale-active', 'active', ?1, ?1, 'codex')",
+                rusqlite::params![stale],
+            )
+            .unwrap();
+
+        let counts = get_agent_counts(&db);
+        assert_eq!(counts.active, 0);
+        assert_eq!(counts.inactive, 1);
+        assert_eq!(counts.total, 1);
     }
 }

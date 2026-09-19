@@ -407,16 +407,39 @@ impl HcomDb {
         if instance_name.is_empty() || session_id.is_empty() {
             return Ok(());
         }
-        self.conn.execute(
-            "DELETE FROM session_bindings WHERE instance_name = ?",
-            params![instance_name],
-        )?;
-        self.conn.execute(
-            "UPDATE instances SET session_id = NULL WHERE session_id = ? AND name != ?",
-            params![session_id, instance_name],
-        )?;
-        self.upsert_session_binding(session_id, instance_name)?;
-        Ok(())
+        let now = now_epoch_f64();
+        self.with_immediate_transaction(|txn| {
+            let exists = txn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM instances WHERE name = ?)",
+                params![instance_name],
+                |row| row.get::<_, bool>(0),
+            )?;
+            if !exists {
+                bail!("cannot bind session to missing instance {instance_name}");
+            }
+
+            txn.execute(
+                "DELETE FROM session_bindings WHERE instance_name = ?",
+                params![instance_name],
+            )?;
+            txn.execute(
+                "UPDATE instances SET session_id = NULL WHERE session_id = ? AND name != ?",
+                params![session_id, instance_name],
+            )?;
+            txn.execute(
+                "UPDATE instances SET session_id = ? WHERE name = ?",
+                params![session_id, instance_name],
+            )?;
+            txn.execute(
+                "INSERT INTO session_bindings (session_id, instance_name, created_at)
+                 VALUES (?, ?, ?)
+                 ON CONFLICT(session_id) DO UPDATE SET
+                     instance_name = excluded.instance_name,
+                     created_at = excluded.created_at",
+                params![session_id, instance_name, now],
+            )?;
+            Ok(())
+        })
     }
 
     /// Check if instance has a session binding (hooks active).
@@ -862,6 +885,38 @@ mod tests {
         assert_eq!(
             db.get_session_binding("sess-new").unwrap(),
             Some("luna".to_string())
+        );
+
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn test_rebind_instance_session_missing_target_is_atomic() {
+        let (db, db_path) = setup_full_test_db();
+
+        db.conn
+            .execute(
+                "INSERT INTO instances (name, session_id, created_at) VALUES ('luna', 'sess-existing', 1000.0)",
+                [],
+            )
+            .unwrap();
+        db.set_session_binding("sess-existing", "luna").unwrap();
+
+        let err = db
+            .rebind_instance_session("missing", "sess-existing")
+            .unwrap_err();
+        assert!(err.to_string().contains("missing instance missing"));
+        assert_eq!(
+            db.get_session_binding("sess-existing").unwrap(),
+            Some("luna".to_string())
+        );
+        assert_eq!(
+            db.get_instance_full("luna")
+                .unwrap()
+                .unwrap()
+                .session_id
+                .as_deref(),
+            Some("sess-existing")
         );
 
         cleanup_test_db(db_path);

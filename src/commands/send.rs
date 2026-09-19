@@ -10,9 +10,7 @@ use crate::messages::{
     InstanceInfo, MessageEnvelope, MessageScope, compute_scope, should_deliver_message,
     validate_intent, validate_message,
 };
-use crate::shared::{
-    CommandContext, SENDER, SenderIdentity, SenderKind, is_inside_ai_tool, status_icon,
-};
+use crate::shared::{CommandContext, SenderIdentity, SenderKind, is_inside_ai_tool, status_icon};
 
 const SEND_AFTER_HELP: &str = "\
 Target matching:
@@ -217,7 +215,7 @@ impl SendArgs {
 /// Get formatted recipient feedback showing who received the message.
 fn get_recipient_feedback(db: &HcomDb, delivered_to: &[String]) -> String {
     if delivered_to.is_empty() {
-        return format!("Sent to: {SENDER}");
+        return "No recipients matched; message was recorded but delivered to nobody".to_string();
     }
     if delivered_to.len() > 10 {
         return format!("Sent to {} agents", delivered_to.len());
@@ -1256,6 +1254,17 @@ mod tests {
         let args = SendArgs::try_parse_from(["send", "@luna", "--", "hello", "there"]).unwrap();
         assert_eq!(args.positionals, vec!["@luna"]);
         assert_eq!(args.message, vec!["hello", "there"]);
+    }
+
+    #[test]
+    fn empty_delivery_feedback_does_not_claim_sender_received_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::HcomDb::open_at(&dir.path().join("hcom.db")).unwrap();
+
+        assert_eq!(
+            get_recipient_feedback(&db, &[]),
+            "No recipients matched; message was recorded but delivered to nobody"
+        );
     }
 
     #[test]

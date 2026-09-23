@@ -305,6 +305,44 @@ fn start_send_events_roundtrip() {
 }
 
 #[test]
+fn missing_mixed_case_estate_name_gets_reclaim_hint_on_all_sender_paths() {
+    let h = Hcom::new();
+    let mixed = "HCC-TestMixed-Probe";
+
+    // Each command builds its own context, so exercise all affected entry points.
+    for args in [
+        vec!["list", "--name", mixed],
+        vec!["relay", "status", "--name", mixed],
+        vec!["send", "--name", mixed, "@nobody", "--", "probe"],
+    ] {
+        let (code, stdout, stderr) = h.run(&args);
+        assert_ne!(code, 0, "args={args:?} stdout={stdout} stderr={stderr}");
+        assert!(
+            stderr.contains(&format!("Instance '{mixed}' not found")),
+            "args={args:?} stderr={stderr}"
+        );
+        assert!(
+            stderr.contains(&format!("hcom start --as {mixed}")),
+            "args={args:?} stderr={stderr}"
+        );
+        assert!(!stderr.contains("Invalid instance name"), "stderr={stderr}");
+    }
+
+    let (code, stdout, stderr) = h.run(["list", "--name", "hcc-testlower-probe"]);
+    assert_ne!(code, 0, "stdout={stdout} stderr={stderr}");
+    assert!(
+        stderr.contains("hcom start --as hcc-testlower-probe"),
+        "stderr={stderr}"
+    );
+
+    let (code, stdout, stderr) = h.run(["start", "--as", mixed]);
+    assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
+    assert!(stdout.contains(&format!("[hcom:{mixed}]")));
+    let (code, stdout, stderr) = h.run(["list", "--name", mixed]);
+    assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
+}
+
+#[test]
 fn registered_estate_names_work_through_name_send_and_start() {
     let h = Hcom::new();
     let registered = ["HCC-OriginPC", "LCC-Laptop:HIHO", "realms-unbound"];
@@ -322,6 +360,9 @@ fn registered_estate_names_work_through_name_send_and_start() {
         .unwrap();
     }
     drop(db);
+
+    let (code, stdout, stderr) = h.run(["list", "--name", "HCC-OriginPC"]);
+    assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
 
     // --name and send must resolve each exact registered identity before
     // applying lowercase/ad-hoc validation or tag parsing.

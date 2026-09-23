@@ -11,12 +11,12 @@ static UUID_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$").unwrap()
 });
 
-/// Valid base instance name: lowercase letters, digits, underscore, and
-/// single hyphen separators.  Estate role names such as `traveller-corpus`
-/// are registered as base names, so sender resolution must accept the same
-/// syntax as registration.
+/// Valid base instance name: ASCII letters, digits, underscore, and single
+/// hyphen separators. Estate role names include both `traveller-corpus` and
+/// mixed-case `HCC-OriginPC`; missing names must reach the reclaim hint too.
+/// Exact registered names are still resolved before this fallback check.
 static BASE_NAME_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^[a-z0-9_]+(?:-[a-z0-9_]+)*$").unwrap());
+    LazyLock::new(|| Regex::new(r"^[A-Za-z0-9_]+(?:-[A-Za-z0-9_]+)*$").unwrap());
 
 /// Dangerous characters for user-provided names (injection prevention).
 static DANGEROUS_CHARS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[|&;$`<>]").unwrap());
@@ -46,7 +46,7 @@ pub fn is_valid_base_name(name: &str) -> bool {
 /// Build error message for invalid base instance names.
 pub fn base_name_error(name: &str) -> String {
     format!(
-        "Invalid instance name '{name}'. Use a lowercase base name containing letters, numbers, underscore, or single hyphen separators."
+        "Invalid instance name '{name}'. Use a base name containing letters, numbers, underscore, or single hyphen separators."
     )
 }
 
@@ -631,7 +631,8 @@ mod tests {
         assert!(is_valid_base_name("luna"));
         assert!(is_valid_base_name("test_name_123"));
         assert!(is_valid_base_name("traveller-corpus"));
-        assert!(!is_valid_base_name("Luna")); // uppercase
+        assert!(is_valid_base_name("Luna"));
+        assert!(is_valid_base_name("HCC-TestMixed-Probe"));
         assert!(!is_valid_base_name("-my-name"));
         assert!(!is_valid_base_name("my-name-"));
         assert!(!is_valid_base_name("my--name"));
@@ -741,6 +742,13 @@ mod tests {
 
         let err = resolve_from_name(&db, "nonexistent").unwrap_err();
         assert!(err.to_string().contains("not found"));
+
+        let err = resolve_from_name(&db, "HCC-TestMixed-Probe").unwrap_err();
+        assert!(err.to_string().contains("not found"));
+        assert!(
+            err.to_string()
+                .contains("hcom start --as HCC-TestMixed-Probe")
+        );
     }
 
     #[test]

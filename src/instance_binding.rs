@@ -2067,12 +2067,13 @@ mod tests {
             Some(serde_json::json!({"last_event_id": before})),
         )
         .unwrap();
-        db.log_event(
-            "message",
-            "luna",
-            &serde_json::json!({"from": "luna", "text": "later", "scope": "broadcast"}),
-        )
-        .unwrap();
+        let later = db
+            .log_event(
+                "message",
+                "luna",
+                &serde_json::json!({"from": "luna", "text": "later", "scope": "broadcast"}),
+            )
+            .unwrap();
 
         assert!(initialize_instance_in_position_file(
             &db,
@@ -2090,8 +2091,10 @@ mod tests {
             None,
             None,
         ));
+        // Creation logs events of its own, so compare with the newest event
+        // that existed when the row was made.
         let row = db.get_instance_full("vera").unwrap().unwrap();
-        assert_eq!(row.last_event_id, db.get_last_event_id());
+        assert_eq!(row.last_event_id, later);
         cleanup(path);
     }
 }

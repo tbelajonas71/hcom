@@ -1228,7 +1228,14 @@ mod tests {
 
         // We last imported id 100; the peer's snapshot now starts at 180.
         let events = vec![own_event(180, "a"), own_event(190, "b")];
-        assert!(import_remote_events(&db, "device-1234", "ABCD", &events, 0.0, "MINE"));
+        assert!(import_remote_events(
+            &db,
+            "device-1234",
+            "ABCD",
+            &events,
+            0.0,
+            "MINE"
+        ));
 
         let gaps = crate::relay::backfill::load_gaps(&db, "device-1234");
         assert_eq!(gaps.len(), 1);
@@ -1250,7 +1257,14 @@ mod tests {
         // The retained tail re-carries id 100, so nothing was skipped even
         // though ids 101..=149 belong to events the peer imported from others.
         let events = vec![own_event(100, "seen"), own_event(150, "new")];
-        assert!(import_remote_events(&db, "device-1234", "ABCD", &events, 0.0, "MINE"));
+        assert!(import_remote_events(
+            &db,
+            "device-1234",
+            "ABCD",
+            &events,
+            0.0,
+            "MINE"
+        ));
         assert!(crate::relay::backfill::load_gaps(&db, "device-1234").is_empty());
     }
 
@@ -1261,7 +1275,14 @@ mod tests {
         let db = HcomDb::open().unwrap();
 
         let events = vec![own_event(5000, "tail")];
-        assert!(import_remote_events(&db, "device-1234", "ABCD", &events, 0.0, "MINE"));
+        assert!(import_remote_events(
+            &db,
+            "device-1234",
+            "ABCD",
+            &events,
+            0.0,
+            "MINE"
+        ));
         assert!(crate::relay::backfill::load_gaps(&db, "device-1234").is_empty());
     }
 

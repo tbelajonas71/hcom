@@ -1037,8 +1037,8 @@ fn handle_remote_events(
     let sql = optional_param(params, "sql").map(|s| s.to_string());
     // Callers whose answer must share a snapshot with other data (catch-up
     // backfill) ask for a smaller byte budget; the hard cap still applies.
-    let byte_cap =
-        usize_param(params, "max_bytes", REMOTE_EVENTS_BYTE_CAP).clamp(1024, REMOTE_EVENTS_BYTE_CAP);
+    let byte_cap = usize_param(params, "max_bytes", REMOTE_EVENTS_BYTE_CAP)
+        .clamp(1024, REMOTE_EVENTS_BYTE_CAP);
     let mut last_n = usize_param(params, "last", 20);
     if last_n == 0 {
         last_n = 20;

@@ -24,6 +24,9 @@ const AUTOMATIC_STOPPERS: &[&str] = &["system", "session", "pty"];
 
 const REMOTE_KEY_PREFIX: &str = "relay_offline_";
 
+/// Stop reason recorded when someone retires a held seat.
+const RETIRED_REASON: &str = "retired";
+
 fn remote_key(device_id: &str) -> String {
     format!("{REMOTE_KEY_PREFIX}{device_id}")
 }
@@ -52,7 +55,8 @@ fn holding_stop(db: &HcomDb, name: &str, now: f64) -> Option<(f64, Value)> {
         return None;
     }
     let by = data.get("by").and_then(|v| v.as_str()).unwrap_or("");
-    if !AUTOMATIC_STOPPERS.contains(&by) {
+    let reason = data.get("reason").and_then(|v| v.as_str()).unwrap_or("");
+    if !AUTOMATIC_STOPPERS.contains(&by) || reason == RETIRED_REASON {
         return None;
     }
     let snapshot = data.get("snapshot").cloned().unwrap_or(Value::Null);
@@ -155,6 +159,29 @@ pub(crate) fn remote_held(db: &HcomDb, now: f64) -> Vec<(String, f64)> {
     out
 }
 
+/// End the hold on `name` because someone said the seat is gone for good.
+/// Returns false when `name` is not held.
+pub(crate) fn retire(db: &HcomDb, name: &str, by: &str, now: f64) -> bool {
+    if holding_stop(db, name, now).is_some() {
+        return db
+            .log_life_event(name, "stopped", by, RETIRED_REASON, None)
+            .is_ok();
+    }
+    let mut retired = false;
+    for (key, raw) in db.kv_prefix(REMOTE_KEY_PREFIX).unwrap_or_default() {
+        let Ok(Value::Object(mut map)) = serde_json::from_str::<Value>(&raw) else {
+            continue;
+        };
+        let before = map.len();
+        map.retain(|held, _| !held.eq_ignore_ascii_case(name));
+        if map.len() != before {
+            retired = true;
+            let _ = db.kv_set(&key, Some(&Value::Object(map).to_string()));
+        }
+    }
+    retired
+}
+
 /// Every held seat, local and remote, with seconds since it went away.
 pub(crate) fn all_held(db: &HcomDb, now: f64) -> Vec<(String, f64)> {
     let mut held = local_held(db, now);
@@ -230,6 +257,31 @@ mod tests {
         stop(&db, "luna", "HCC-LendPC", 50, None);
         assert_eq!(local_held(&db, now()), vec![]);
         assert_eq!(held_cursor(&db, "luna", now()), None);
+    }
+
+    #[test]
+    #[serial]
+    fn retiring_ends_a_local_or_remote_hold() {
+        let (_dir, _hcom_dir, _home, _guard) = isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        stop(&db, "luna", "system", 40, None);
+        remember_remote(&db, "dev-1", &["nova:ABCD".to_string()], now());
+
+        assert!(retire(&db, "luna", "HCC-LendPC", now()));
+        assert!(retire(&db, "nova:ABCD", "HCC-LendPC", now()));
+        assert!(!retire(&db, "nobody", "HCC-LendPC", now()));
+        assert!(all_held(&db, now()).is_empty());
+        assert_eq!(held_cursor(&db, "luna", now()), None);
+    }
+
+    #[test]
+    #[serial]
+    fn a_retirement_by_the_system_does_not_restart_the_hold() {
+        let (_dir, _hcom_dir, _home, _guard) = isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        stop(&db, "luna", "system", 40, None);
+        assert!(retire(&db, "luna", "system", now()));
+        assert!(local_held(&db, now()).is_empty());
     }
 
     #[test]

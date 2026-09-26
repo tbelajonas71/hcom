@@ -21,8 +21,7 @@ use serde_json::json;
 
 use super::replay::ReplayGuard;
 use super::{
-    get_broker_from_config, is_relay_enabled, load_psk, read_device_uuid, set_relay_status,
-    state_topic, wildcard_topic,
+    is_relay_enabled, load_psk, read_device_uuid, set_relay_status, state_topic, wildcard_topic,
 };
 
 /// Build a TLS config that combines webpki-roots (bundled Mozilla CAs for Android/Termux

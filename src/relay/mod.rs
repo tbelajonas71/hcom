@@ -1333,12 +1333,13 @@ mod tests {
         assert!(safe_kv_get(&db, "relay_status").is_none());
     }
     fn relay_config(primary: &str, backup: &str) -> HcomConfig {
-        let mut config = HcomConfig::default();
-        config.relay = primary.to_string();
-        config.relay_backup = backup.to_string();
-        config.relay_id = "relay-test".to_string();
-        config.relay_enabled = true;
-        config
+        HcomConfig {
+            relay: primary.to_string(),
+            relay_backup: backup.to_string(),
+            relay_id: "relay-test".to_string(),
+            relay_enabled: true,
+            ..HcomConfig::default()
+        }
     }
 
     #[test]

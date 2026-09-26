@@ -938,6 +938,7 @@ struct LegacyNotifyEndpointProof {
 }
 
 impl LegacyNotifyEndpointProof {
+    #[cfg(test)]
     fn updated_at(&self) -> f64 {
         f64::from_bits(self.updated_at_bits)
     }
@@ -1818,12 +1819,9 @@ fn validate_codex_relocation(
         .get("transcript_path")
         .and_then(serde_json::Value::as_str)
         .filter(|value| !value.is_empty())
+        && !same_path(snapshot_transcript, &derived_transcript)
     {
-        if !same_path(snapshot_transcript, &derived_transcript) {
-            bail!(
-                "Refusing to relocate '{target_name}': stopped and active transcript paths differ"
-            );
-        }
+        bail!("Refusing to relocate '{target_name}': stopped and active transcript paths differ");
     }
     let relocation_sessions_root = std::env::var("CODEX_HOME")
         .ok()

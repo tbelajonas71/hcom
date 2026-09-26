@@ -286,6 +286,25 @@ pub fn cmd_stop(db: &HcomDb, args: &StopArgs, ctx: Option<&CommandContext>) -> i
     let position = match db.get_instance_full(&instance_name) {
         Ok(Some(data)) => data,
         _ => {
+            // A held seat has no row to stop; stopping it ends the hold so it
+            // is no longer addressable (see held_identities).
+            let launcher = resolve_initiator(db, ctx, explicit_name);
+            if crate::held_identities::retire(
+                db,
+                &instance_name,
+                &launcher,
+                crate::shared::time::now_epoch_f64(),
+            ) {
+                log_info(
+                    "lifecycle",
+                    "stop.retire_held",
+                    &format!("name={instance_name} initiated_by={launcher}"),
+                );
+                println!(
+                    "Retired {instance_name}: it was held while away and is no longer addressable."
+                );
+                return 0;
+            }
             eprintln!("Error: '{instance_name}' not found");
             return 1;
         }

@@ -785,6 +785,11 @@ pub fn initialize_instance_in_position_file(
 
             let initial_event_id = match launch_event_id {
                 Some(id) if id <= current_max => id,
+                // A seat the system stopped on its own resumes where it
+                // stopped, so messages held for it are not skipped.
+                None => crate::held_identities::held_cursor(db, instance_name, now)
+                    .filter(|id| *id <= current_max)
+                    .unwrap_or(current_max),
                 _ => current_max,
             };
 
@@ -1988,6 +1993,105 @@ mod tests {
         // preserved for anyone who hasn't set HCOM_TIMEOUT.
         assert_eq!(row.wait_timeout, Some(86400));
 
+        cleanup(path);
+    }
+    #[test]
+    #[serial]
+    fn a_seat_the_system_stopped_resumes_at_its_saved_cursor() {
+        let (db, path) = setup_test_db();
+        let before = db
+            .log_event(
+                "message",
+                "luna",
+                &serde_json::json!({"from": "luna", "text": "earlier", "scope": "broadcast"}),
+            )
+            .unwrap();
+        db.log_life_event(
+            "vera",
+            "stopped",
+            "system",
+            "stale_cleanup",
+            Some(serde_json::json!({"last_event_id": before})),
+        )
+        .unwrap();
+        db.log_event(
+            "message",
+            "luna",
+            &serde_json::json!({"from": "luna", "text": "while away", "scope": "mentions", "mentions": ["vera"]}),
+        )
+        .unwrap();
+
+        assert!(initialize_instance_in_position_file(
+            &db,
+            "vera",
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("claude"),
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ));
+        let row = db.get_instance_full("vera").unwrap().unwrap();
+        assert_eq!(row.last_event_id, before);
+        let unread: Vec<String> = db
+            .get_unread_messages("vera")
+            .into_iter()
+            .map(|m| m.text)
+            .collect();
+        assert_eq!(unread, vec!["while away".to_string()]);
+        cleanup(path);
+    }
+
+    #[test]
+    #[serial]
+    fn a_seat_someone_stopped_starts_at_the_newest_event() {
+        let (db, path) = setup_test_db();
+        let before = db
+            .log_event(
+                "message",
+                "luna",
+                &serde_json::json!({"from": "luna", "text": "earlier", "scope": "broadcast"}),
+            )
+            .unwrap();
+        db.log_life_event(
+            "vera",
+            "stopped",
+            "HCC-LendPC",
+            "killed",
+            Some(serde_json::json!({"last_event_id": before})),
+        )
+        .unwrap();
+        db.log_event(
+            "message",
+            "luna",
+            &serde_json::json!({"from": "luna", "text": "later", "scope": "broadcast"}),
+        )
+        .unwrap();
+
+        assert!(initialize_instance_in_position_file(
+            &db,
+            "vera",
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("claude"),
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ));
+        let row = db.get_instance_full("vera").unwrap().unwrap();
+        assert_eq!(row.last_event_id, db.get_last_event_id());
         cleanup(path);
     }
 }

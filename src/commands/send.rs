@@ -228,7 +228,7 @@ fn get_recipient_feedback(db: &HcomDb, delivered_to: &[String]) -> String {
             let display = identity::get_display_name(db, name);
             parts.push(format!("{icon} {display}"));
         } else {
-            parts.push(format!("◌ {name}"));
+            parts.push(format!("◌ {name} (away: held until it binds again)"));
         }
     }
     format!("Sent to: {}", parts.join(", "))
@@ -317,7 +317,37 @@ fn resolve_delivery(
 
     // Compute scope and routing. Thread-only sends keep their original message
     // semantics; membership only affects the delivery target set.
-    let scope_result = compute_scope(message, &rows, explicit_targets)?;
+    //
+    // A target with no live row may be a held seat (see held_identities): one
+    // the system stopped on its own, or a remote seat whose device is away.
+    // Only then are held seats added, so the usual send pays nothing for it.
+    let (scope_result, held_targets) = match compute_scope(message, &rows, explicit_targets) {
+        Ok(scope) => (scope, Vec::new()),
+        Err(original) => {
+            let held: Vec<InstanceInfo> =
+                crate::held_identities::all_held(db, crate::shared::time::now_epoch_f64())
+                    .into_iter()
+                    .map(|(name, _)| InstanceInfo { name, tag: None })
+                    .collect();
+            if held.is_empty() {
+                return Err(original);
+            }
+            let mut with_held = rows.clone();
+            with_held.extend(held.iter().cloned());
+            match compute_scope(message, &with_held, explicit_targets) {
+                Ok(scope) => {
+                    let held_targets: Vec<String> = scope
+                        .mentions
+                        .iter()
+                        .filter(|m| held.iter().any(|h| &h.name == *m))
+                        .cloned()
+                        .collect();
+                    (scope, held_targets)
+                }
+                Err(_) => return Err(original),
+            }
+        }
+    };
     let thread_delivery_members =
         if let Some(thread) = envelope.and_then(|env| env.thread.as_deref()) {
             if scope_result.scope == MessageScope::Broadcast {
@@ -347,13 +377,19 @@ fn resolve_delivery(
     };
 
     let scope_data = build_scope_data(identity, effective_scope, &effective_mentions);
-    let delivered_to = rows
+    let mut delivered_to: Vec<String> = rows
         .iter()
         .filter(|inst| {
             should_deliver_message(&scope_data, &inst.name, &identity.name).unwrap_or(false)
         })
         .map(|inst| inst.name.clone())
         .collect();
+    // Held seats are addressed, not yet delivered; they read it when they bind.
+    for name in held_targets {
+        if !delivered_to.contains(&name) {
+            delivered_to.push(name);
+        }
+    }
 
     Ok(ResolvedDelivery {
         original_scope: scope_result.scope,
@@ -2101,5 +2137,114 @@ mod tests {
         let (targets, msg) = process_positionals(&["@luna".to_string(), "hello".to_string()]);
         assert_eq!(targets, vec!["luna"]);
         assert_eq!(msg.as_deref(), Some("hello"));
+    }
+    fn instance_sender(name: &str) -> SenderIdentity {
+        SenderIdentity {
+            kind: SenderKind::Instance,
+            name: name.into(),
+            instance_data: None,
+            session_id: None,
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn a_send_to_a_seat_the_system_stopped_is_held_not_refused() {
+        let (db, path, _env) = setup_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, created_at) VALUES ('luna', 1000.0)",
+                [],
+            )
+            .unwrap();
+        db.log_life_event(
+            "vera",
+            "stopped",
+            "session",
+            "exit:clear",
+            Some(serde_json::json!({"last_event_id": 1})),
+        )
+        .unwrap();
+
+        let delivered = send_message(
+            &db,
+            &instance_sender("luna"),
+            "are you there",
+            None,
+            Some(&["vera".to_string()]),
+        )
+        .unwrap();
+        assert_eq!(delivered, vec!["vera".to_string()]);
+
+        let mentions: String = db
+            .conn()
+            .query_row(
+                "SELECT json_extract(data, '$.mentions') FROM events WHERE type = 'message' ORDER BY id DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(mentions, r#"["vera"]"#);
+        cleanup_test_db(path);
+    }
+
+    #[test]
+    #[serial]
+    fn a_send_to_a_seat_someone_stopped_is_still_refused() {
+        let (db, path, _env) = setup_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, created_at) VALUES ('luna', 1000.0)",
+                [],
+            )
+            .unwrap();
+        db.log_life_event(
+            "vera",
+            "stopped",
+            "HCC-LendPC",
+            "killed",
+            Some(serde_json::json!({"last_event_id": 1})),
+        )
+        .unwrap();
+
+        let err = send_message(
+            &db,
+            &instance_sender("luna"),
+            "are you there",
+            None,
+            Some(&["vera".to_string()]),
+        )
+        .unwrap_err();
+        assert!(err.contains("non-existent or stopped"), "{err}");
+        cleanup_test_db(path);
+    }
+
+    #[test]
+    #[serial]
+    fn a_send_to_a_seat_on_an_away_device_is_held() {
+        let (db, path, _env) = setup_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, created_at) VALUES ('luna', 1000.0)",
+                [],
+            )
+            .unwrap();
+        crate::held_identities::remember_remote(
+            &db,
+            "dev-1",
+            &["nova:ABCD".to_string()],
+            crate::shared::time::now_epoch_f64(),
+        );
+
+        let delivered = send_message(
+            &db,
+            &instance_sender("luna"),
+            "@nova:ABCD back online yet?",
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(delivered, vec!["nova:ABCD".to_string()]);
+        cleanup_test_db(path);
     }
 }

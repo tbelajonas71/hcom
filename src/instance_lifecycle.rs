@@ -889,6 +889,7 @@ fn cleanup_stale_remote_instances(db: &HcomDb) {
             if sync_time > 0.0 && (now - sync_time) <= REMOTE_DEVICE_STALE_THRESHOLD {
                 continue;
             }
+            crate::relay::pull::remember_device_instances(db, &device_id);
             if let Err(e) = db.conn().execute(
                 "DELETE FROM instances WHERE origin_device_id = ?",
                 rusqlite::params![device_id],

@@ -318,6 +318,8 @@ pub fn clear_relay_device_state(db: &HcomDb) {
         "relay_sync_time_",
         "relay_state_ts_",
         "relay_ctrl_",
+        "relay_gap_",
+        "relay_offline_",
     ];
     for prefix in &prefixes {
         if let Ok(entries) = db.kv_prefix(prefix) {

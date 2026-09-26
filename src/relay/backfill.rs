@@ -189,7 +189,11 @@ pub(crate) fn apply_answer(
     response: &Value,
 ) -> Result<AnswerOutcome, String> {
     let result = response.get("result").cloned().unwrap_or(Value::Null);
-    if !response.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+    if !response
+        .get("ok")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
         let detail = result
             .get("error")
             .and_then(|v| v.as_str())
@@ -412,7 +416,11 @@ mod tests {
     fn synced_peer(db: &HcomDb, short: &str, caps: &str) {
         safe_kv_set(db, &format!("relay_short_{short}"), Some(PEER));
         let now = crate::shared::time::now_epoch_f64();
-        safe_kv_set(db, &format!("relay_sync_time_{PEER}"), Some(&now.to_string()));
+        safe_kv_set(
+            db,
+            &format!("relay_sync_time_{PEER}"),
+            Some(&now.to_string()),
+        );
         safe_kv_set(db, &format!("relay_caps_{PEER}"), Some(caps));
     }
 
@@ -457,7 +465,10 @@ mod tests {
         let db = HcomDb::open().unwrap();
 
         record_gap(&db, PEER, "ABCD", 10, 11);
-        assert!(load_gaps(&db, PEER).is_empty(), "no id lies strictly between");
+        assert!(
+            load_gaps(&db, PEER).is_empty(),
+            "no id lies strictly between"
+        );
 
         record_gap(&db, PEER, "ABCD", 10, 40);
         record_gap(&db, PEER, "ABCD", 10, 40);
@@ -486,20 +497,31 @@ mod tests {
         assert_eq!(short, "ABCD");
         let sql = params["sql"].as_str().unwrap();
         assert!(sql.contains("id > 10 AND id < 20"), "{sql}");
-        assert!(sql.contains("json_extract(data, '$._relay') IS NULL"), "{sql}");
+        assert!(
+            sql.contains("json_extract(data, '$._relay') IS NULL"),
+            "{sql}"
+        );
 
         // No answer yet and not timed out: nothing is re-sent.
-        let summary = tick(&db, "MINE", 1005.0, &mut |_, _, _| panic!("must not resend"));
+        let summary = tick(&db, "MINE", 1005.0, &mut |_, _, _| {
+            panic!("must not resend")
+        });
         assert_eq!(summary, TickSummary::default());
 
         // The answer arrives inside the peer's snapshot as an imported rpc_result.
         db.log_event(
             "rpc_result",
             "_rpc",
-            &answer(&request_id, vec![message(15, "second"), message(12, "first")], false),
+            &answer(
+                &request_id,
+                vec![message(15, "second"), message(12, "first")],
+                false,
+            ),
         )
         .unwrap();
-        let summary = tick(&db, "MINE", 1006.0, &mut |_, _, _| panic!("must not resend"));
+        let summary = tick(&db, "MINE", 1006.0, &mut |_, _, _| {
+            panic!("must not resend")
+        });
         assert_eq!(summary.events_imported, 2);
         assert_eq!(summary.gaps_closed, 1);
         assert!(load_gaps(&db, PEER).is_empty());
@@ -536,7 +558,10 @@ mod tests {
             true
         });
         // Newest-first page of exactly BACKFILL_BATCH events: 400..=499.
-        let page: Vec<Value> = (400..500).rev().map(|id| message(id, &format!("m{id}"))).collect();
+        let page: Vec<Value> = (400..500)
+            .rev()
+            .map(|id| message(id, &format!("m{id}")))
+            .collect();
         db.log_event("rpc_result", "_rpc", &answer(&request_id, page, false))
             .unwrap();
 
@@ -549,7 +574,10 @@ mod tests {
         assert_eq!(summary.gaps_closed, 0);
         let gaps = load_gaps(&db, PEER);
         assert_eq!((gaps[0].after, gaps[0].before), (1, 400));
-        let sql = second.expect("follow-up request")["sql"].as_str().unwrap().to_string();
+        let sql = second.expect("follow-up request")["sql"]
+            .as_str()
+            .unwrap()
+            .to_string();
         assert!(sql.contains("id > 1 AND id < 400"), "{sql}");
     }
 
@@ -597,7 +625,9 @@ mod tests {
         });
         db.log_event("rpc_result", "_rpc", &answer(&request_id, vec![], false))
             .unwrap();
-        let summary = tick(&db, "MINE", 1001.0, &mut |_, _, _| panic!("must not resend"));
+        let summary = tick(&db, "MINE", 1001.0, &mut |_, _, _| {
+            panic!("must not resend")
+        });
         assert_eq!(summary.gaps_closed, 1);
         assert_eq!(summary.events_imported, 0);
         assert!(load_gaps(&db, PEER).is_empty());
@@ -640,7 +670,11 @@ mod tests {
         for _ in 0..(BACKFILL_MAX_ATTEMPTS + 2) {
             // Keep the peer fresh so only the attempt budget ends the gap.
             let fresh = crate::shared::time::now_epoch_f64();
-            safe_kv_set(&db, &format!("relay_sync_time_{PEER}"), Some(&fresh.to_string()));
+            safe_kv_set(
+                &db,
+                &format!("relay_sync_time_{PEER}"),
+                Some(&fresh.to_string()),
+            );
             tick(&db, "MINE", now, &mut |_, _, _| {
                 sends += 1;
                 true
@@ -648,7 +682,10 @@ mod tests {
             now += BACKFILL_RETRY_SECS;
         }
         assert_eq!(sends, BACKFILL_MAX_ATTEMPTS as usize);
-        assert!(load_gaps(&db, PEER).is_empty(), "abandoned after the attempt budget");
+        assert!(
+            load_gaps(&db, PEER).is_empty(),
+            "abandoned after the attempt budget"
+        );
     }
 
     #[test]
@@ -660,7 +697,9 @@ mod tests {
         safe_kv_set(&db, &format!("relay_sync_time_{PEER}"), Some("1.0"));
         record_gap(&db, PEER, "ABCD", 10, 20);
 
-        let summary = tick(&db, "MINE", 1000.0, &mut |_, _, _| panic!("peer is offline"));
+        let summary = tick(&db, "MINE", 1000.0, &mut |_, _, _| {
+            panic!("peer is offline")
+        });
         assert_eq!(summary, TickSummary::default());
         let gaps = load_gaps(&db, PEER);
         assert_eq!(gaps.len(), 1);

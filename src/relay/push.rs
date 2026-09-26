@@ -109,7 +109,9 @@ fn shrink_event(event: &mut Value) {
         let large: Vec<String> = data
             .iter()
             .filter(|(_, v)| {
-                serde_json::to_string(v).map(|s| s.len()).unwrap_or(usize::MAX)
+                serde_json::to_string(v)
+                    .map(|s| s.len())
+                    .unwrap_or(usize::MAX)
                     > SHRINK_KEEP_FIELD_BYTES
             })
             .map(|(k, _)| k.clone())

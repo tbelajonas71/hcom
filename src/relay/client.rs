@@ -697,22 +697,23 @@ impl MqttRelay {
         let config = HcomConfig::load(None).unwrap_or_default();
         let own_short_id = super::device_short_id_for_db(&db, &self.device_uuid);
         let now = crate::shared::time::now_epoch_f64();
-        let summary = super::backfill::tick(&db, &own_short_id, now, &mut |short, request_id, params| {
-            let Some((topic, payload)) = super::control::build_rpc_control_payload(
-                &db,
-                &config,
-                super::control::rpc_action::EVENTS,
-                short,
-                request_id,
-                params,
-            ) else {
-                return false;
-            };
-            // try_publish never blocks the worker loop on a full request queue.
-            self.client
-                .try_publish(topic, QoS::AtLeastOnce, false, payload)
-                .is_ok()
-        });
+        let summary =
+            super::backfill::tick(&db, &own_short_id, now, &mut |short, request_id, params| {
+                let Some((topic, payload)) = super::control::build_rpc_control_payload(
+                    &db,
+                    &config,
+                    super::control::rpc_action::EVENTS,
+                    short,
+                    request_id,
+                    params,
+                ) else {
+                    return false;
+                };
+                // try_publish never blocks the worker loop on a full request queue.
+                self.client
+                    .try_publish(topic, QoS::AtLeastOnce, false, payload)
+                    .is_ok()
+            });
         if summary.requests_sent > 0 || summary.events_imported > 0 || summary.gaps_abandoned > 0 {
             log::log_with_fields(
                 "INFO",

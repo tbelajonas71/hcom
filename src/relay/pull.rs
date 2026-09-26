@@ -107,6 +107,7 @@ fn open_envelope_for_handler(
 /// Handle an authenticated null state from a departing device.
 /// Removes all instances belonging to the disconnected device.
 pub fn handle_device_gone(db: &HcomDb, device_id: &str) {
+    remember_device_instances(db, device_id);
     if let Err(e) = db.conn().execute(
         "DELETE FROM instances WHERE origin_device_id = ?",
         params![device_id],
@@ -134,6 +135,27 @@ pub fn handle_device_gone(db: &HcomDb, device_id: &str) {
         false,
     );
     log::log_info("relay", "relay.device_gone", &format!("device={}", prefix));
+}
+
+/// Keep a departing device's seats addressable (see held_identities).
+pub(crate) fn remember_device_instances(db: &HcomDb, device_id: &str) {
+    let names: Vec<String> = db
+        .conn()
+        .prepare("SELECT name FROM instances WHERE origin_device_id = ?")
+        .ok()
+        .map(|mut stmt| {
+            stmt.query_map(params![device_id], |row| row.get::<_, String>(0))
+                .ok()
+                .map(|rows| rows.filter_map(|r| r.ok()).collect())
+                .unwrap_or_default()
+        })
+        .unwrap_or_default();
+    crate::held_identities::remember_remote(
+        db,
+        device_id,
+        &names,
+        crate::shared::time::now_epoch_f64(),
+    );
 }
 
 /// Handle a control message from the control topic.
@@ -461,12 +483,21 @@ pub fn handle_state_message(
         })
         .unwrap_or_default();
 
-    for name in &current_remote {
-        if !seen_instances.contains(name) {
-            let _ = db
-                .conn()
-                .execute("DELETE FROM instances WHERE name = ?", params![name]);
-        }
+    let departed: Vec<String> = current_remote
+        .iter()
+        .filter(|name| !seen_instances.contains(*name))
+        .cloned()
+        .collect();
+    crate::held_identities::remember_remote(
+        db,
+        device_id,
+        &departed,
+        crate::shared::time::now_epoch_f64(),
+    );
+    for name in &departed {
+        let _ = db
+            .conn()
+            .execute("DELETE FROM instances WHERE name = ?", params![name]);
     }
 
     // Handle control events in the events payload

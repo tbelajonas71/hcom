@@ -1080,6 +1080,7 @@ pub(super) mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[serial_test::serial]
     fn open_restricts_the_configured_hcom_directory_and_database() {
         use std::os::unix::fs::PermissionsExt;
 

@@ -27,6 +27,10 @@ pub mod test_helpers {
     // other (e.g. one test's config write lands in another's tempdir).
     // Recover from poison so a panic in one test doesn't cascade-fail the
     // next — the shared state is just "one set of env vars at a time."
+    //
+    // This lock and serial_test's #[serial] lock do not exclude each other, and
+    // many #[serial] tests set env vars. So a test that holds an EnvGuard must
+    // also be #[serial]; otherwise it runs beside those tests and loses its env.
     static TEST_ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
     fn acquire_env_lock() -> MutexGuard<'static, ()> {

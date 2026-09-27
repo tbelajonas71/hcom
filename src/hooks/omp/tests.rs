@@ -660,6 +660,7 @@ fn plugin_dir_respects_pi_coding_agent_dir() {
 }
 
 #[test]
+#[serial_test::serial]
 fn extension_inject_args_contains_absolute_plugin_path() {
     with_isolated_omp_env(|_| {
         let args = extension_inject_args();
@@ -728,6 +729,7 @@ fn plugin_source_handles_omp_session_switch_and_shutdown_shape() {
 }
 
 #[test]
+#[serial_test::serial]
 fn install_writes_plugin_source() {
     with_isolated_omp_env(|_| {
         assert!(install_omp_plugin().unwrap());
@@ -738,6 +740,7 @@ fn install_writes_plugin_source() {
 }
 
 #[test]
+#[serial_test::serial]
 fn install_refuses_to_overwrite_non_hcom_file() {
     with_isolated_omp_env(|_| {
         let path = get_omp_plugin_path();
@@ -755,6 +758,7 @@ fn install_refuses_to_overwrite_non_hcom_file() {
 }
 
 #[test]
+#[serial_test::serial]
 fn install_upgrades_stale_hcom_owned_plugin() {
     with_isolated_omp_env(|_| {
         let path = get_omp_plugin_path();
@@ -769,6 +773,7 @@ fn install_upgrades_stale_hcom_owned_plugin() {
 }
 
 #[test]
+#[serial_test::serial]
 fn remove_deletes_hcom_plugin() {
     with_isolated_omp_env(|_| {
         install_omp_plugin().unwrap();
@@ -781,6 +786,7 @@ fn remove_deletes_hcom_plugin() {
 }
 
 #[test]
+#[serial_test::serial]
 fn remove_preserves_non_hcom_file() {
     with_isolated_omp_env(|_| {
         let path = get_omp_plugin_path();

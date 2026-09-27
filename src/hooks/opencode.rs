@@ -915,10 +915,8 @@ mod tests {
     #[test]
     #[serial]
     fn test_get_opencode_plugin_dir_defaults_to_xdg_global_path() {
+        let _guard = EnvGuard::new();
         let dir = tempfile::tempdir().unwrap();
-        let saved_home = std::env::var("HOME").ok();
-        let saved_hcom = std::env::var("HCOM_DIR").ok();
-        let saved_xdg = std::env::var("XDG_CONFIG_HOME").ok();
         let home = dir.path().join("home");
         let xdg = dir.path().join("xdg");
         std::fs::create_dir_all(home.join(".hcom")).unwrap();
@@ -932,22 +930,6 @@ mod tests {
             get_opencode_plugin_dir(),
             xdg.join("opencode").join("plugins")
         );
-
-        if let Some(home) = saved_home {
-            unsafe { std::env::set_var("HOME", home) };
-        } else {
-            unsafe { std::env::remove_var("HOME") };
-        }
-        if let Some(hcom) = saved_hcom {
-            unsafe { std::env::set_var("HCOM_DIR", hcom) };
-        } else {
-            unsafe { std::env::remove_var("HCOM_DIR") };
-        }
-        if let Some(xdg) = saved_xdg {
-            unsafe { std::env::set_var("XDG_CONFIG_HOME", xdg) };
-        } else {
-            unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
-        }
     }
 
     #[test]
@@ -985,9 +967,8 @@ mod tests {
     #[test]
     #[serial]
     fn test_verify_plugin_installed_rejects_stale_canonical_plugin() {
+        let _guard = EnvGuard::new();
         let dir = tempfile::tempdir().unwrap();
-        let saved_home = std::env::var("HOME").ok();
-        let saved_hcom = std::env::var("HCOM_DIR").ok();
         unsafe {
             std::env::set_var("HOME", dir.path());
             std::env::set_var("HCOM_DIR", dir.path().join(".hcom"));
@@ -998,17 +979,6 @@ mod tests {
         std::fs::write(&plugin_path, "// stale plugin").unwrap();
 
         assert!(!verify_opencode_plugin_installed());
-
-        if let Some(home) = saved_home {
-            unsafe { std::env::set_var("HOME", home) };
-        } else {
-            unsafe { std::env::remove_var("HOME") };
-        }
-        if let Some(hcom) = saved_hcom {
-            unsafe { std::env::set_var("HCOM_DIR", hcom) };
-        } else {
-            unsafe { std::env::remove_var("HCOM_DIR") };
-        }
     }
 
     #[test]

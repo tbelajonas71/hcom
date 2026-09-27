@@ -1444,6 +1444,7 @@ mod tests {
     // `Config` mid-test, whose process-wide cache other parallel tests can reset.
     #[cfg(unix)]
     #[test]
+    #[serial_test::serial]
     fn ensure_conn_secures_existing_broad_database() {
         use std::os::unix::fs::PermissionsExt;
 

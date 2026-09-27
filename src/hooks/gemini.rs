@@ -2094,8 +2094,9 @@ mod tests {
         let settings_dir = dir.path().join(".gemini");
         std::fs::create_dir_all(&settings_dir).unwrap();
 
-        // Redirect paths via HCOM_DIR
-        let saved = std::env::var("HCOM_DIR").ok();
+        // Redirect paths via HCOM_DIR. EnvGuard takes the shared env lock and
+        // restores HCOM_DIR even when an assert below panics.
+        let _guard = EnvGuard::new();
         unsafe { std::env::set_var("HCOM_DIR", &hcom_dir) };
 
         let success = setup_gemini_hooks(true);
@@ -2125,13 +2126,6 @@ mod tests {
         assert!(remove_ok);
         let verify_after_remove = verify_hooks_at(&settings_path, false).is_ok();
         assert!(!verify_after_remove, "verify should fail after remove");
-
-        // Restore
-        if let Some(v) = saved {
-            unsafe { std::env::set_var("HCOM_DIR", v) };
-        } else {
-            unsafe { std::env::remove_var("HCOM_DIR") };
-        }
     }
 
     use crate::hooks::test_helpers::{EnvGuard, isolated_test_env};

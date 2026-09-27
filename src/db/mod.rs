@@ -981,6 +981,35 @@ pub(super) fn chrono_now_iso() -> String {
     crate::shared::time::now_iso()
 }
 
+/// A test database path that no earlier test run can have used.
+///
+/// These paths used to be `<prefix><pid>_<counter>.db` in the shared temp
+/// dir. Windows reuses pids, and those files are left behind whenever a test
+/// fails or skips its cleanup, so a later run with the same pid could open a
+/// database that already held another run's rows. Every test in that family
+/// then failed at once, with UNIQUE constraint errors. The process start time
+/// makes the name unique across runs.
+#[cfg(test)]
+pub(crate) fn unique_test_db_path(prefix: &str) -> std::path::PathBuf {
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static RUN: OnceLock<u128> = OnceLock::new();
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let run = *RUN.get_or_init(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    });
+    std::env::temp_dir().join(format!(
+        "{}{}_{}_{}.db",
+        prefix,
+        std::process::id(),
+        run,
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    ))
+}
+
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
@@ -1163,16 +1192,7 @@ pub(super) mod tests {
 
     /// Create a test DB with full init_db() schema
     pub(super) fn setup_full_test_db() -> (HcomDb, PathBuf) {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-        let temp_dir = std::env::temp_dir();
-        let test_id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let db_path = temp_dir.join(format!(
-            "test_hcom_full_{}_{}.db",
-            std::process::id(),
-            test_id
-        ));
+        let db_path = crate::db::unique_test_db_path("test_hcom_full_");
 
         let db = HcomDb::open_at(&db_path).unwrap();
         (db, db_path)
@@ -1329,16 +1349,7 @@ pub(super) mod tests {
 
     #[test]
     fn test_ensure_schema_fresh_db() {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static COUNTER: AtomicU64 = AtomicU64::new(1000);
-
-        let temp_dir = std::env::temp_dir();
-        let test_id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let db_path = temp_dir.join(format!(
-            "test_hcom_ensure_{}_{}.db",
-            std::process::id(),
-            test_id
-        ));
+        let db_path = crate::db::unique_test_db_path("test_hcom_ensure_");
 
         let mut db = HcomDb::open_raw(&db_path).unwrap();
         db.ensure_schema().unwrap();
@@ -1355,16 +1366,7 @@ pub(super) mod tests {
 
     #[test]
     fn test_ensure_schema_archives_old_version() {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static COUNTER: AtomicU64 = AtomicU64::new(2000);
-
-        let temp_dir = std::env::temp_dir();
-        let test_id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let db_path = temp_dir.join(format!(
-            "test_hcom_archive_{}_{}.db",
-            std::process::id(),
-            test_id
-        ));
+        let db_path = crate::db::unique_test_db_path("test_hcom_archive_");
 
         // Create a DB with old schema version
         {
@@ -1391,7 +1393,7 @@ pub(super) mod tests {
         assert_eq!(version, SCHEMA_VERSION);
 
         // Archive directory should exist
-        let archive_dir = temp_dir.join("archive");
+        let archive_dir = db_path.parent().unwrap().join("archive");
         if archive_dir.exists() {
             let _ = std::fs::remove_dir_all(&archive_dir);
         }
@@ -1401,16 +1403,7 @@ pub(super) mod tests {
 
     #[test]
     fn test_ensure_schema_migrates_v16_to_v18_in_place_without_status_time() {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static COUNTER: AtomicU64 = AtomicU64::new(2500);
-
-        let temp_dir = std::env::temp_dir();
-        let test_id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let db_path = temp_dir.join(format!(
-            "test_hcom_migrate_{}_{}.db",
-            std::process::id(),
-            test_id
-        ));
+        let db_path = crate::db::unique_test_db_path("test_hcom_migrate_");
 
         {
             let conn = Connection::open(&db_path).unwrap();
@@ -1482,16 +1475,7 @@ pub(super) mod tests {
 
     #[test]
     fn test_ensure_schema_migrates_v17_to_v18_using_status_time() {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static COUNTER: AtomicU64 = AtomicU64::new(2750);
-
-        let temp_dir = std::env::temp_dir();
-        let test_id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let db_path = temp_dir.join(format!(
-            "test_hcom_migrate_status_time_{}_{}.db",
-            std::process::id(),
-            test_id
-        ));
+        let db_path = crate::db::unique_test_db_path("test_hcom_migrate_status_time_");
 
         {
             let conn = Connection::open(&db_path).unwrap();
@@ -1537,16 +1521,7 @@ pub(super) mod tests {
 
     #[test]
     fn test_ensure_schema_column_guard() {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static COUNTER: AtomicU64 = AtomicU64::new(3000);
-
-        let temp_dir = std::env::temp_dir();
-        let test_id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let db_path = temp_dir.join(format!(
-            "test_hcom_colguard_{}_{}.db",
-            std::process::id(),
-            test_id
-        ));
+        let db_path = crate::db::unique_test_db_path("test_hcom_colguard_");
 
         // Create a DB at current version but missing 'tool' column
         {
@@ -1601,16 +1576,7 @@ pub(super) mod tests {
     /// this via migration instead of archiving (which would lose data).
     #[test]
     fn test_ensure_schema_repairs_stamped_but_not_migrated_db() {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static COUNTER: AtomicU64 = AtomicU64::new(4000);
-
-        let temp_dir = std::env::temp_dir();
-        let test_id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let db_path = temp_dir.join(format!(
-            "test_hcom_repair_{}_{}.db",
-            std::process::id(),
-            test_id
-        ));
+        let db_path = crate::db::unique_test_db_path("test_hcom_repair_");
 
         // Simulate the bug: create a v16-style DB but stamp it as v17
         // (this is what init_db() did — CREATE IF NOT EXISTS is a no-op on

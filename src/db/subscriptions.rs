@@ -1206,16 +1206,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     fn setup_full_test_db() -> (HcomDb, PathBuf) {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static COUNTER: AtomicU64 = AtomicU64::new(10_000);
-
-        let temp_dir = std::env::temp_dir();
-        let test_id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let db_path = temp_dir.join(format!(
-            "test_hcom_subscriptions_{}_{}.db",
-            std::process::id(),
-            test_id
-        ));
+        let db_path = crate::db::unique_test_db_path("test_hcom_subscriptions_");
 
         let db = HcomDb::open_raw(&db_path).unwrap();
         db.init_db().unwrap();

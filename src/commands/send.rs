@@ -1538,19 +1538,10 @@ mod tests {
     }
 
     fn setup_test_db() -> (HcomDb, PathBuf, TestEnv) {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-
         // send_message() reaches the process-global relay notification path,
         // so its ambient HCOM_DIR must live as long as the test DB.
         let env = crate::hooks::test_helpers::isolated_test_env();
-        let temp_dir = std::env::temp_dir();
-        let test_id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let db_path = temp_dir.join(format!(
-            "test_hcom_send_{}_{}.db",
-            std::process::id(),
-            test_id
-        ));
+        let db_path = crate::db::unique_test_db_path("test_hcom_send_");
 
         let db = HcomDb::open_at(&db_path).unwrap();
         (db, db_path, env)

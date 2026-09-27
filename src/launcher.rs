@@ -3301,7 +3301,11 @@ mod tests {
     // Windows generates a PowerShell runner with a different shape.
     #[cfg(unix)]
     #[test]
+    #[serial]
     fn test_runner_script_strips_instance_state_vars() {
+        // Runner scripts are written under hcom_dir(): isolate it, or this
+        // test writes into whatever HCOM_DIR a parallel test left behind.
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
         let env = HashMap::from([
             ("GEMINI_PTY_INFO".to_string(), "child_process".to_string()),
             ("GEMINI_API_KEY".to_string(), "gem-key".to_string()),
@@ -3351,7 +3355,11 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[serial]
     fn test_run_here_runner_preserves_current_pane_identity() {
+        // Runner scripts are written under hcom_dir(): isolate it, or this
+        // test writes into whatever HCOM_DIR a parallel test left behind.
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
         let env = HashMap::from([
             ("HERDR_PANE_ID".to_string(), "w1:current".to_string()),
             ("RORI_MY_VAR".to_string(), "myval".to_string()),
@@ -3374,7 +3382,11 @@ mod tests {
     // create_runner_script_windows() isn't cfg(windows)-gated (only its call
     // site is, via a runtime cfg!(windows) check), so this runs on any host.
     #[test]
+    #[serial]
     fn test_runner_script_windows_has_bom_and_propagates_exit_code() {
+        // Runner scripts are written under hcom_dir(): isolate it, or this
+        // test writes into whatever HCOM_DIR a parallel test left behind.
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
         let env = HashMap::from([
             ("SOME_SECRET".to_string(), "sekrit".to_string()),
             ("herdr_pane_id".to_string(), "w1:old".to_string()),
@@ -3428,7 +3440,11 @@ mod tests {
     // executables, so the child re-splits argv at quote boundaries (#66 —
     // `hcom codex` failed on its quote-bearing `-c` values).
     #[test]
+    #[serial]
     fn test_runner_script_windows_passes_args_via_sidecar_file() {
+        // Runner scripts are written under hcom_dir(): isolate it, or this
+        // test writes into whatever HCOM_DIR a parallel test left behind.
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
         let env = HashMap::new();
         let args = vec![
             "-c".to_string(),
@@ -3466,7 +3482,11 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_runner_script_windows_no_args_skips_sidecar_file() {
+        // Runner scripts are written under hcom_dir(): isolate it, or this
+        // test writes into whatever HCOM_DIR a parallel test left behind.
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
         let env = HashMap::new();
         let script =
             create_runner_script_windows("gemini", "/tmp", "test-noargs", &env, &[], false)

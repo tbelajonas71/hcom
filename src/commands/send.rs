@@ -459,10 +459,21 @@ pub fn send_message(
     validate_message(message)?;
 
     let delivery = resolve_delivery(db, identity, message, envelope, explicit_targets)?;
+    // A request addressed only to the sender reaches nobody (a sender never receives its own
+    // message) and is accepted, as upstream accepts it: refusing it broke upstream's own
+    // antigravity_e2e_hook_dispatch test, which sends itself a request as a fixture. Fan-out
+    // (more than one recipient) and a request that reaches nobody else are still refused.
+    let self_addressed = delivery.delivered_to.is_empty()
+        && !delivery.effective_mentions.is_empty()
+        && delivery
+            .effective_mentions
+            .iter()
+            .all(|m| m.split(':').next().unwrap_or(m) == identity.name);
     if envelope
         .and_then(|env| env.intent.as_ref())
         .is_some_and(|intent| intent.as_str() == "request")
         && delivery.delivered_to.len() != 1
+        && !self_addressed
     {
         return Err(format!(
             "Intent 'request' requires exactly one recipient; resolved {}. Use --intent inform for fan-out.",
@@ -1779,6 +1790,56 @@ mod tests {
             )
             .unwrap();
         assert_eq!(reqwatch_count, 0);
+
+        cleanup_test_db(path);
+    }
+
+    #[test]
+    #[serial]
+    fn send_message_request_to_self_is_accepted_but_still_reaches_nobody() {
+        let (db, path, _env) = setup_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, created_at) VALUES ('luna', 1000.0), ('nova', 1000.0)",
+                [],
+            )
+            .unwrap();
+        let sender = SenderIdentity {
+            kind: SenderKind::Instance,
+            name: "luna".into(),
+            instance_data: None,
+            session_id: None,
+        };
+        let envelope = MessageEnvelope {
+            intent: Some(crate::messages::MessageIntent::Request),
+            ..Default::default()
+        };
+        let delivered = send_message(
+            &db,
+            &sender,
+            "note to self",
+            Some(&envelope),
+            Some(&["luna".to_string()]),
+        )
+        .expect("a request addressed only to the sender is accepted, as upstream does");
+        assert!(
+            delivered.is_empty(),
+            "the sender never receives its own message"
+        );
+
+        // Self plus one other is exactly one recipient and is accepted; fan-out to two
+        // others is still refused (send_message_request_fanout_fails_before_event_or_watch_creation).
+        let err = send_message(
+            &db,
+            &sender,
+            "status?",
+            Some(&envelope),
+            Some(&["luna".to_string(), "nova".to_string()]),
+        );
+        assert!(
+            err.is_ok(),
+            "self + one other resolves exactly one recipient: {err:?}"
+        );
 
         cleanup_test_db(path);
     }

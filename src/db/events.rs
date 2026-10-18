@@ -5,6 +5,13 @@ use rusqlite::params;
 
 use super::{HcomDb, chrono_now_iso, subscriptions};
 
+#[cfg(test)]
+pub(crate) static BENCH_EVENT_SQL_US: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+#[cfg(test)]
+pub(crate) static BENCH_SUBSCRIPTION_US: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// Message from the events table
 #[derive(Debug, Clone)]
 pub struct Message {
@@ -480,14 +487,28 @@ impl HcomDb {
         };
         let data_str = serde_json::to_string(data)?;
 
+        #[cfg(test)]
+        let sql_start = std::time::Instant::now();
         self.conn.execute(
             "INSERT INTO events (timestamp, type, instance, data) VALUES (?, ?, ?, ?)",
             params![ts, event_type, instance, data_str],
         )?;
+        #[cfg(test)]
+        BENCH_EVENT_SQL_US.fetch_add(
+            sql_start.elapsed().as_micros() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         let event_id = self.conn.last_insert_rowid();
 
         // Check event subscriptions inline.
+        #[cfg(test)]
+        let sub_start = std::time::Instant::now();
         subscriptions::process_logged_event(self, event_id, event_type, instance, data);
+        #[cfg(test)]
+        BENCH_SUBSCRIPTION_US.fetch_add(
+            sub_start.elapsed().as_micros() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
 
         Ok(event_id)
     }

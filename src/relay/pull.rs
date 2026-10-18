@@ -15,6 +15,10 @@ use super::crypto;
 use super::replay::ReplayGuard;
 use super::{device_short_id_for_db, remember_device_short_id, safe_kv_get, safe_kv_set};
 
+#[cfg(test)]
+static BENCH_NOTIFY_US: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// Crypto + replay context shared by all inbound message handlers.
 pub struct InboundContext<'a> {
     pub psk: &'a [u8; 32],
@@ -523,7 +527,14 @@ pub fn handle_state_message(
     // relay liveness traffic into a permanent TCP fan-out storm on large
     // registries. Wake only when the snapshot actually changed local work.
     if should_push || imported_new_events {
+        #[cfg(test)]
+        let notify_start = std::time::Instant::now();
         crate::notify::wake_all(db);
+        #[cfg(test)]
+        BENCH_NOTIFY_US.fetch_add(
+            notify_start.elapsed().as_micros() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
 
     should_push
@@ -1161,5 +1172,103 @@ mod tests {
 
         assert!(db.get_instance_full("luna:ABCD").unwrap().is_none());
         assert_eq!(safe_kv_get(&db, "relay_state_ts_device-1234"), None);
+    }
+
+    /// Manual copy-only timing of the production relay apply path. Both input
+    /// paths must be disposable copies, never the active hcom.db.
+    #[test]
+    #[ignore]
+    #[serial]
+    fn bench_relay_apply_on_copies() {
+        fn run(db: &HcomDb, start_batch: i64, transaction: bool) -> (Vec<u128>, [u64; 9]) {
+            use std::sync::atomic::Ordering;
+            let snapshot = || [
+                crate::db::events::BENCH_EVENT_SQL_US.load(Ordering::Relaxed),
+                crate::db::events::BENCH_SUBSCRIPTION_US.load(Ordering::Relaxed),
+                crate::db::subscriptions::BENCH_REQWATCH_CLEAR_US.load(Ordering::Relaxed),
+                crate::db::subscriptions::BENCH_SUBS_LOAD_US.load(Ordering::Relaxed),
+                crate::db::subscriptions::BENCH_SUBS_LOOP_US.load(Ordering::Relaxed),
+                crate::db::subscriptions::BENCH_SUBS_SWEEP_US.load(Ordering::Relaxed),
+                crate::db::subscriptions::BENCH_FILTER_QUERY_US.load(Ordering::Relaxed),
+                crate::db::subscriptions::BENCH_FILTER_QUERY_COUNT.load(Ordering::Relaxed),
+                BENCH_NOTIFY_US.load(Ordering::Relaxed),
+            ];
+            let before_metrics = snapshot();
+            let psk = fixture_psk();
+            let mut guard = ReplayGuard::default();
+            let topic = "bench-local/bench-device-20261003";
+            let device = "bench-device-20261003";
+            let filler = "x".repeat(1200);
+            let now = crate::shared::time::now_epoch_f64() as u64;
+            let mut times = Vec::new();
+            for batch in start_batch..start_batch + 10 {
+                let events: Vec<Value> = (0..40)
+                    .map(|n| {
+                        let id = batch * 40 + n + 1;
+                        json!({"id": id, "type": "status", "instance": "bench-seat",
+                            "ts": now, "data": {"status": "active", "detail": filler}})
+                    })
+                    .collect();
+                let instances: serde_json::Map<String, Value> = (0..6)
+                    .map(|n| {
+                        (format!("bench-seat-{n}"), json!({"status": "active",
+                            "status_time": now as f64, "tool": "codex"}))
+                    })
+                    .collect();
+                let payload = json!({"state": {"short_id": "BENCH", "reset_ts": 0.0,
+                    "instances": instances}, "events": events});
+                let bytes = serde_json::to_vec(&payload).unwrap();
+                let sealed = crate::relay::crypto::seal(
+                    &psk, "bench-local", topic, &bytes, now + batch as u64,
+                )
+                .unwrap();
+                let before = std::time::Instant::now();
+                if transaction {
+                    db.conn().execute_batch("BEGIN IMMEDIATE").unwrap();
+                }
+                handle_state_message(
+                    db, device, &sealed, "bench-own-device",
+                    &mut InboundContext { psk: &psk, relay_id: "bench-local", topic,
+                        replay_guard: &mut guard },
+                );
+                if transaction {
+                    db.conn().execute_batch("COMMIT").unwrap();
+                }
+                times.push(before.elapsed().as_micros());
+            }
+            let after_metrics = snapshot();
+            (times, std::array::from_fn(|i| after_metrics[i] - before_metrics[i]))
+        }
+        fn report(label: &str, mode: &str, result: (Vec<u128>, [u64; 9])) {
+            let (mut times, metrics) = result;
+            let [sql_us, subs_us, clear_us, load_us, loop_us, sweep_us,
+                filter_us, filter_count, notify_us] = metrics;
+            let total_us: u128 = times.iter().sum();
+            times.sort_unstable();
+            eprintln!("BENCH {label} {mode} count={} p50_us={} p95_us={} max_us={} total_us={} event_sql_us={} subscriptions_us={} sub_clear_us={} sub_load_us={} sub_loop_us={} sub_sweep_us={} filter_query_us={} filter_query_count={} notify_us={} other_us={}",
+                times.len(), times[times.len() / 2], times[times.len() * 95 / 100],
+                times[times.len() - 1], total_us, sql_us, subs_us, clear_us, load_us,
+                loop_us, sweep_us, filter_us, filter_count, notify_us,
+                total_us.saturating_sub(sql_us as u128 + subs_us as u128));
+        }
+
+        let baseline = std::path::PathBuf::from(std::env::var("HCOM_BENCH_BASE").unwrap());
+        let trial = std::path::PathBuf::from(std::env::var("HCOM_BENCH_TRIAL").unwrap());
+        assert_ne!(baseline, trial);
+        for path in [&baseline, &trial] {
+            assert!(path.file_name().unwrap().to_string_lossy().starts_with("bench-"));
+            crate::paths::test_roots::register(path.parent().unwrap());
+        }
+        let base_db = HcomDb::open_at(&baseline).unwrap();
+        let trial_db = HcomDb::open_at(&trial).unwrap();
+        // A production apply wakes all registered endpoints. Remove them from
+        // these disposable copies so the benchmark cannot wake real seats.
+        for db in [&base_db, &trial_db] {
+            db.conn().execute("DELETE FROM notify_endpoints", []).unwrap();
+        }
+        report("before-prune", "pass-1", run(&base_db, 0, false));
+        report("after-prune", "pass-1", run(&trial_db, 0, false));
+        report("after-prune", "pass-2", run(&trial_db, 10, false));
+        report("before-prune", "pass-2", run(&base_db, 10, false));
     }
 }

@@ -23,7 +23,7 @@ use rusqlite::{Connection, Transaction, TransactionBehavior};
 use crate::shared::time::now_epoch_f64;
 
 mod claude_actors;
-mod events;
+pub(crate) mod events;
 mod instances;
 mod kv;
 mod notify;

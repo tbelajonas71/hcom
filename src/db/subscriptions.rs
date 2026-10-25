@@ -28,6 +28,24 @@ use rusqlite::{Connection, params};
 use serde_json::json;
 
 use super::HcomDb;
+#[cfg(test)]
+pub(crate) static BENCH_REQWATCH_CLEAR_US: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+#[cfg(test)]
+pub(crate) static BENCH_SUBS_LOAD_US: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+#[cfg(test)]
+pub(crate) static BENCH_SUBS_LOOP_US: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+#[cfg(test)]
+pub(crate) static BENCH_SUBS_SWEEP_US: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+#[cfg(test)]
+pub(crate) static BENCH_FILTER_QUERY_US: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+#[cfg(test)]
+pub(crate) static BENCH_FILTER_QUERY_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 use crate::core::filters::{FILE_WRITE_CONTEXTS, build_sql_from_flags};
 use crate::messages::{InstanceInfo, MessageScope, ScopeResult, compute_scope, resolve_targets};
 use crate::shared::constants::extract_mentions;
@@ -609,10 +627,19 @@ pub(crate) fn process_logged_event(
     if event_type == "status" {
         let status = data.get("status").and_then(|v| v.as_str()).unwrap_or("");
         if status == "active" || status == "blocked" {
+            #[cfg(test)]
+            let clear_start = std::time::Instant::now();
             clear_agy_reqwatch_idle_grace(db, instance);
+            #[cfg(test)]
+            BENCH_REQWATCH_CLEAR_US.fetch_add(
+                clear_start.elapsed().as_micros() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
         }
     }
 
+    #[cfg(test)]
+    let load_start = std::time::Instant::now();
     let rows: Vec<(String, String)> = match db.conn.prepare_cached(
         "SELECT key, value FROM kv
          WHERE key LIKE 'events_sub:%'
@@ -628,11 +655,18 @@ pub(crate) fn process_logged_event(
             .unwrap_or_default(),
         Err(_) => return,
     };
+    #[cfg(test)]
+    BENCH_SUBS_LOAD_US.fetch_add(
+        load_start.elapsed().as_micros() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
 
     if rows.is_empty() {
         return;
     }
 
+    #[cfg(test)]
+    let loop_start = std::time::Instant::now();
     for (key, value) in &rows {
         let sub: serde_json::Value = match serde_json::from_str(value) {
             Ok(v) => v,
@@ -664,6 +698,8 @@ pub(crate) fn process_logged_event(
                 })
                 .unwrap_or_default();
 
+            #[cfg(test)]
+            let filter_start = std::time::Instant::now();
             let matched = if stored_params.is_empty() {
                 db.conn
                     .query_row(&filter_query, params![event_id], |_| Ok(()))
@@ -679,6 +715,14 @@ pub(crate) fn process_logged_event(
                     .query_row(&filter_query, refs.as_slice(), |_| Ok(()))
                     .is_ok()
             };
+            #[cfg(test)]
+            {
+                BENCH_FILTER_QUERY_US.fetch_add(
+                    filter_start.elapsed().as_micros() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                BENCH_FILTER_QUERY_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
 
             if !matched {
                 continue;
@@ -823,10 +867,22 @@ pub(crate) fn process_logged_event(
             }
         }
     }
+    #[cfg(test)]
+    BENCH_SUBS_LOOP_US.fetch_add(
+        loop_start.elapsed().as_micros() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
 
     // A grace expiry is not itself an event. Sweep after handling the current
     // event so replies, active/blocked transitions, and stop events win first.
+    #[cfg(test)]
+    let sweep_start = std::time::Instant::now();
     sweep_expired_reqwatch_graces(db, crate::shared::time::now_epoch_f64());
+    #[cfg(test)]
+    BENCH_SUBS_SWEEP_US.fetch_add(
+        sweep_start.elapsed().as_micros() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
 }
 
 /// Load all reqwatch subscriptions as (key, parsed_sub, filters) tuples.

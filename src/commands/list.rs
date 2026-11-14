@@ -56,6 +56,12 @@ pub struct ListArgs {
 /// state says it is blocked. This does not change delivery retries or timeouts.
 const DELIVERY_STALLED_AFTER_SECS: i64 = 60;
 
+/// How many of the newest events the unread count looks at. A seat left registered for days sits millions of
+/// events behind, and counting from its cursor JSON-parses every message since: on LendPC (2026-11-14) eleven such
+/// rows made `hcom list` take up to 3 minutes. Past the window the count is a lower bound and the age still shows
+/// the backlog as old, which is all `list` needs.
+const UNREAD_SCAN_WINDOW: i64 = 50_000;
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct UnreadInfo {
     count: i64,
@@ -76,13 +82,22 @@ struct DeliveryVisibility {
 /// used only to age that fact; an unparseable timestamp remains visible as
 /// unread but never manufactures a stalled signal.
 fn get_unread_info(db: &HcomDb, name: &str, last_event_id: i64, now: i64) -> UnreadInfo {
+    get_unread_info_window(db, name, last_event_id, now, UNREAD_SCAN_WINDOW)
+}
+
+fn get_unread_info_window(db: &HcomDb, name: &str, last_event_id: i64, now: i64, window: i64) -> UnreadInfo {
+    let newest: i64 = db
+        .conn()
+        .query_row("SELECT COALESCE(MAX(id), 0) FROM events", [], |row| row.get(0))
+        .unwrap_or(0);
+    let floor = last_event_id.max(newest.saturating_sub(window));
     let (count, oldest_timestamp): (i64, Option<String>) = db
         .conn()
         .query_row(
             "SELECT COUNT(*), MIN(timestamp) FROM events
              WHERE id > ? AND type = 'message'
              AND EXISTS (SELECT 1 FROM json_each(json_extract(data, '$.delivered_to')) WHERE value = ?)",
-            rusqlite::params![last_event_id, name],
+            rusqlite::params![floor, name],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap_or((0, None));
@@ -1306,5 +1321,11 @@ mod tests {
 
         assert_eq!(unread.count, 1);
         assert_eq!(unread.oldest_age_seconds, Some(120));
+
+        // A cursor far behind only scans the newest `window` events: the old message falls outside a window of 1.
+        let windowed = get_unread_info_window(&db, "desktop", 0, now, 1);
+        assert_eq!(windowed.count, 0);
+        let wide = get_unread_info_window(&db, "desktop", 0, now, 1_000);
+        assert_eq!(wide, unread);
     }
 }

@@ -3125,15 +3125,24 @@ mod tests {
 
         let (_tmp, _hcom_dir, test_home) = crate::hooks::test_helpers::isolate_env_under_guard();
         let hooks_path = get_codex_hooks_path();
-        assert!(hooks_path.starts_with(&test_home), "{hooks_path:?} not under {test_home:?}");
+        assert!(
+            hooks_path.starts_with(&test_home),
+            "{hooks_path:?} not under {test_home:?}"
+        );
         assert_eq!(hooks_path, test_home.join(".codex").join("hooks.json"));
         for name in crate::hooks::test_helpers::TOOL_HOME_OVERRIDES {
-            assert!(std::env::var(name).is_err(), "{name} still set inside the isolated env");
+            assert!(
+                std::env::var(name).is_err(),
+                "{name} still set inside the isolated env"
+            );
         }
 
         assert!(setup_codex_hooks(false));
         assert!(hooks_path.exists());
-        assert_eq!(std::fs::read_to_string(&live_hooks).unwrap(), "{\"hooks\":{}}");
+        assert_eq!(
+            std::fs::read_to_string(&live_hooks).unwrap(),
+            "{\"hooks\":{}}"
+        );
         assert_eq!(std::fs::read_dir(&live_codex).unwrap().count(), 1);
     }
 

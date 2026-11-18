@@ -1648,7 +1648,7 @@ fn verify_hooks_at(settings_path: &Path, check_permissions: bool) -> Result<(), 
 ///
 /// Removes hooks from settings.json and policy file from policies/.
 pub fn remove_gemini_hooks() -> bool {
-    let global_path = dirs::home_dir()
+    let global_path = crate::runtime_env::platform_home_dir()
         .map(|h| h.join(".gemini").join("settings.json"))
         .unwrap_or_default();
     let env_path = std::env::var("GEMINI_CLI_HOME")
@@ -1669,7 +1669,7 @@ pub fn remove_gemini_hooks() -> bool {
     };
 
     // Remove policy files
-    let global_policies = dirs::home_dir()
+    let global_policies = crate::runtime_env::platform_home_dir()
         .map(|h| h.join(".gemini").join("policies"))
         .unwrap_or_default();
     let env_policies = std::env::var("GEMINI_CLI_HOME")

@@ -67,7 +67,9 @@ fn cursor_config_dir() -> PathBuf {
 }
 
 fn default_cursor_config_dir() -> PathBuf {
-    dirs::home_dir().unwrap_or_default().join(".cursor")
+    crate::runtime_env::platform_home_dir()
+        .unwrap_or_default()
+        .join(".cursor")
 }
 
 pub fn get_cursor_hooks_path() -> PathBuf {
@@ -76,7 +78,7 @@ pub fn get_cursor_hooks_path() -> PathBuf {
 
 pub fn get_cursor_permissions_path() -> PathBuf {
     let root = crate::runtime_env::tool_config_root();
-    if dirs::home_dir().as_deref() != Some(root.as_path()) {
+    if crate::runtime_env::platform_home_dir().as_deref() != Some(root.as_path()) {
         return root.join(".cursor").join("cli.json");
     }
     if let Ok(dir) = std::env::var("CURSOR_CONFIG_DIR")
@@ -368,7 +370,7 @@ fn push_unique(paths: &mut Vec<PathBuf>, path: PathBuf) {
 
 fn cursor_hooks_cleanup_paths() -> Vec<PathBuf> {
     let mut paths = Vec::new();
-    if let Some(home) = dirs::home_dir() {
+    if let Some(home) = crate::runtime_env::platform_home_dir() {
         push_unique(&mut paths, home.join(".cursor").join("hooks.json"));
     }
     push_unique(&mut paths, get_cursor_hooks_path());
@@ -377,11 +379,11 @@ fn cursor_hooks_cleanup_paths() -> Vec<PathBuf> {
 
 fn cursor_permissions_cleanup_paths() -> Vec<PathBuf> {
     let mut paths = Vec::new();
-    if let Some(home) = dirs::home_dir() {
+    if let Some(home) = crate::runtime_env::platform_home_dir() {
         push_unique(&mut paths, home.join(".cursor").join("cli-config.json"));
     }
     let root = crate::runtime_env::tool_config_root();
-    if dirs::home_dir().as_deref() != Some(root.as_path()) {
+    if crate::runtime_env::platform_home_dir().as_deref() != Some(root.as_path()) {
         push_unique(&mut paths, root.join(".cursor").join("cli.json"));
     }
     if let Ok(dir) = std::env::var("CURSOR_CONFIG_DIR")

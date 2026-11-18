@@ -19,6 +19,8 @@ use serde_json::Value;
 /// Shared test helpers for hook test modules (claude, codex, gemini).
 #[cfg(test)]
 pub mod test_helpers {
+    use std::ffi::OsString;
+    use std::marker::PhantomData;
     use std::path::PathBuf;
     use std::sync::{Mutex, MutexGuard, OnceLock};
 
@@ -58,29 +60,25 @@ pub mod test_helpers {
         "PI_PROFILE",
     ];
 
-    /// The values of SAVED_ENV_VARS at one moment; dropping it puts them back (set or unset).
-    /// It takes no lock itself: create it only while holding an EnvGuard.
-    pub struct EnvSnapshot {
-        saved: Vec<(&'static str, Option<String>)>,
+    /// The values of SAVED_ENV_VARS at one moment (as OsString, so non-UTF-8 values survive).
+    /// Private: only EnvGuard and EnvSnapshot, which both prove the env lock is held, use it.
+    struct RawEnvSnapshot {
+        saved: Vec<(&'static str, Option<OsString>)>,
     }
 
-    impl EnvSnapshot {
-        pub fn capture(_guard: &EnvGuard) -> Self {
-            Self::capture_locked()
-        }
-
-        fn capture_locked() -> Self {
+    impl RawEnvSnapshot {
+        fn capture() -> Self {
             Self {
                 saved: SAVED_ENV_VARS
                     .iter()
-                    .map(|name| (*name, std::env::var(name).ok()))
+                    .map(|name| (*name, std::env::var_os(name)))
                     .collect(),
             }
         }
-    }
 
-    impl Drop for EnvSnapshot {
-        fn drop(&mut self) {
+        /// Put every saved var back (set or unset), then rebuild Config from the restored env so
+        /// it never keeps pointing at a tempdir that is about to be deleted.
+        fn restore(&self) {
             unsafe {
                 for (name, value) in &self.saved {
                     match value {
@@ -89,14 +87,38 @@ pub mod test_helpers {
                     }
                 }
             }
+            crate::config::Config::reset();
+            crate::config::Config::init();
+        }
+    }
+
+    /// A nested save point inside a test that already holds an EnvGuard. It borrows the guard, so
+    /// the borrow checker refuses any order in which the guard (and its lock) is gone before the
+    /// snapshot restores.
+    pub struct EnvSnapshot<'a> {
+        raw: RawEnvSnapshot,
+        _guard: PhantomData<&'a EnvGuard>,
+    }
+
+    impl<'a> EnvSnapshot<'a> {
+        pub fn capture(_guard: &'a EnvGuard) -> Self {
+            Self {
+                raw: RawEnvSnapshot::capture(),
+                _guard: PhantomData,
+            }
+        }
+    }
+
+    impl Drop for EnvSnapshot<'_> {
+        fn drop(&mut self) {
+            self.raw.restore();
         }
     }
 
     /// RAII guard: holds the process-wide env lock, saves every var in SAVED_ENV_VARS, and on drop
     /// restores them and resets Config.
     pub struct EnvGuard {
-        // Restored in Drop::drop (taken out of the Option there) while the lock below is held.
-        snapshot: Option<EnvSnapshot>,
+        raw: RawEnvSnapshot,
         // Declared last so it drops AFTER Drop::drop restores env vars,
         // releasing the lock only once this test's env state is gone.
         _lock: MutexGuard<'static, ()>,
@@ -112,7 +134,7 @@ pub mod test_helpers {
         pub fn new() -> Self {
             let lock = acquire_env_lock();
             Self {
-                snapshot: Some(EnvSnapshot::capture_locked()),
+                raw: RawEnvSnapshot::capture(),
                 _lock: lock,
             }
         }
@@ -120,9 +142,7 @@ pub mod test_helpers {
 
     impl Drop for EnvGuard {
         fn drop(&mut self) {
-            drop(self.snapshot.take());
-            crate::config::Config::reset();
-            crate::config::Config::init();
+            self.raw.restore();
         }
     }
 

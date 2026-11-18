@@ -190,7 +190,7 @@ pub fn derive_codex_transcript_path(session_id: &str) -> Option<String> {
     }
 
     let codex_base = std::env::var("CODEX_HOME").ok().unwrap_or_else(|| {
-        dirs::home_dir()
+        crate::runtime_env::platform_home_dir()
             .map(|h| h.join(".codex").to_string_lossy().to_string())
             .unwrap_or_default()
     });
@@ -2637,7 +2637,7 @@ fn remove_codex_hooks_from_dir(base: &std::path::Path) -> bool {
 ///
 /// Cleans the default (~/.codex), env-var (CODEX_HOME), and active HCOM_DIR-local paths.
 pub fn remove_codex_hooks() -> bool {
-    let default_dir = dirs::home_dir()
+    let default_dir = crate::runtime_env::platform_home_dir()
         .map(|h| h.join(".codex"))
         .unwrap_or_default();
     let env_dir = std::env::var("CODEX_HOME")
@@ -3140,13 +3140,43 @@ mod tests {
             );
         }
 
+        // The "global" home behind ~/.codex, ~/.claude, ~/.gemini is the tempdir too (on Windows
+        // dirs::home_dir() alone would be the developer's live profile).
+        assert_eq!(
+            crate::runtime_env::platform_home_dir().as_deref(),
+            Some(test_home.as_path())
+        );
+
         assert!(setup_codex_hooks(false));
         assert!(hooks_path.exists());
+        assert!(remove_codex_hooks());
+        assert!(crate::hooks::claude::remove_claude_hooks());
+        assert!(crate::hooks::gemini::remove_gemini_hooks());
         assert_eq!(
             std::fs::read_to_string(&live_hooks).unwrap(),
             "{\"hooks\":{}}"
         );
         assert_eq!(std::fs::read_dir(&live_codex).unwrap().count(), 1);
+        for name in crate::hooks::test_helpers::TOOL_HOME_OVERRIDES {
+            let seeded = live.path().join(name.to_ascii_lowercase());
+            assert!(
+                !seeded.exists(),
+                "{name}: something wrote to the live {seeded:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_every_cleared_override_is_also_restored() {
+        use crate::hooks::test_helpers::{SAVED_ENV_VARS, TOOL_HOME_OVERRIDES};
+        for name in TOOL_HOME_OVERRIDES {
+            assert!(
+                SAVED_ENV_VARS.contains(name),
+                "{name} is cleared but never restored"
+            );
+        }
+        assert!(SAVED_ENV_VARS.contains(&"CODEX_HOME"));
+        assert!(SAVED_ENV_VARS.contains(&"HOME"));
     }
 
     #[test]
@@ -3165,8 +3195,8 @@ mod tests {
             assert!(std::env::var("CLAUDE_CONFIG_DIR").is_err());
         }
         assert_eq!(
-            std::env::var("CLAUDE_CONFIG_DIR").ok().as_deref(),
-            outer.path().to_str()
+            std::env::var_os("CLAUDE_CONFIG_DIR").as_deref(),
+            Some(outer.path().as_os_str())
         );
 
         // Saved as None: a value set afterwards is removed again on drop.
@@ -3174,8 +3204,9 @@ mod tests {
         {
             let _snapshot = EnvSnapshot::capture(&guard);
             unsafe { std::env::set_var("CLAUDE_CONFIG_DIR", outer.path()) };
+            assert!(std::env::var_os("CLAUDE_CONFIG_DIR").is_some());
         }
-        assert!(std::env::var("CLAUDE_CONFIG_DIR").is_err());
+        assert!(std::env::var_os("CLAUDE_CONFIG_DIR").is_none());
     }
 
     #[test]

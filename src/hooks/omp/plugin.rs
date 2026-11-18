@@ -4,7 +4,7 @@ const PLUGIN_FILENAME: &str = "hcom.ts";
 fn current_home_dir() -> std::path::PathBuf {
     std::env::var("HOME")
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| dirs::home_dir().unwrap_or_default())
+        .unwrap_or_else(|_| crate::runtime_env::platform_home_dir().unwrap_or_default())
 }
 
 fn omp_plugin_dir() -> std::path::PathBuf {

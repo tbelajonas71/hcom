@@ -3422,7 +3422,7 @@ fn remove_hooks_from_settings_path(settings_path: &Path) -> bool {
 /// Cleans both global (~/.claude/settings.json) and local (HCOM_DIR-based) paths.
 /// Only removes hcom-specific hooks, not the whole file.
 pub fn remove_claude_hooks() -> bool {
-    let global_path = dirs::home_dir()
+    let global_path = crate::runtime_env::platform_home_dir()
         .map(|h| h.join(".claude").join("settings.json"))
         .unwrap_or_default();
     let env_path = std::env::var("CLAUDE_CONFIG_DIR")

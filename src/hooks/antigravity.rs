@@ -652,7 +652,7 @@ fn antigravity_cleanup_dirs() -> Vec<PathBuf> {
             dirs.push(dir);
         }
     };
-    if let Some(home) = dirs::home_dir() {
+    if let Some(home) = crate::runtime_env::platform_home_dir() {
         push_unique(home.join(".gemini"));
     }
     if let Ok(dir) = std::env::var("GEMINI_CLI_HOME")

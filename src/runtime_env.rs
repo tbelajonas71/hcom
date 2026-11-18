@@ -67,6 +67,24 @@ pub(crate) fn user_home() -> Option<std::path::PathBuf> {
     dirs::home_dir()
 }
 
+/// The platform home folder behind the "global" tool config paths that hook install/remove
+/// touch (~/.claude, ~/.codex, ~/.gemini, ~/.cursor, ...).
+///
+/// In the real binary this is exactly `dirs::home_dir()` (the user profile on Windows). In test
+/// builds it honours `HOME` first: on Windows `dirs::home_dir()` ignores `HOME`, so a test that
+/// redirected `HOME` into a tempdir would otherwise still install or remove hooks in the
+/// developer's live profile.
+pub(crate) fn platform_home_dir() -> Option<std::path::PathBuf> {
+    #[cfg(test)]
+    {
+        user_home()
+    }
+    #[cfg(not(test))]
+    {
+        dirs::home_dir()
+    }
+}
+
 /// Cross-platform user config base directory.
 ///
 /// Resolution order:

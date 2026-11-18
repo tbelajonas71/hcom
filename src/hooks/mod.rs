@@ -19,6 +19,8 @@ use serde_json::Value;
 /// Shared test helpers for hook test modules (claude, codex, gemini).
 #[cfg(test)]
 pub mod test_helpers {
+    use std::ffi::OsString;
+    use std::marker::PhantomData;
     use std::path::PathBuf;
     use std::sync::{Mutex, MutexGuard, OnceLock};
 
@@ -36,24 +38,87 @@ pub mod test_helpers {
             .unwrap_or_else(|e| e.into_inner())
     }
 
-    /// RAII guard that saves/restores HCOM_DIR and HOME env vars, and resets Config.
+    /// Every env var a test may change: hcom's own, HOME, the test Codex version pin, and each
+    /// tool-home override. EnvGuard saves all of them on entry and puts them back on drop.
+    pub const SAVED_ENV_VARS: &[&str] = &[
+        "HCOM_DIR",
+        "HOME",
+        "CODEX_HOME",
+        "HCOM_TEST_CODEX_CLI_VERSION",
+        "CLAUDE_CONFIG_DIR",
+        "CURSOR_CONFIG_DIR",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+        "GEMINI_CLI_HOME",
+        "KILO_CONFIG_DIR",
+        "KIMI_CODE_HOME",
+        "COPILOT_HOME",
+        "PI_CODING_AGENT_DIR",
+        "PI_CODING_AGENT_SESSION_DIR",
+        "PI_CONFIG_DIR",
+        "OMP_PROFILE",
+        "PI_PROFILE",
+    ];
+
+    /// The values of SAVED_ENV_VARS at one moment (as OsString, so non-UTF-8 values survive).
+    /// Private: only EnvGuard and EnvSnapshot, which both prove the env lock is held, use it.
+    struct RawEnvSnapshot {
+        saved: Vec<(&'static str, Option<OsString>)>,
+    }
+
+    impl RawEnvSnapshot {
+        fn capture() -> Self {
+            Self {
+                saved: SAVED_ENV_VARS
+                    .iter()
+                    .map(|name| (*name, std::env::var_os(name)))
+                    .collect(),
+            }
+        }
+
+        /// Put every saved var back (set or unset), then rebuild Config from the restored env so
+        /// it never keeps pointing at a tempdir that is about to be deleted.
+        fn restore(&self) {
+            unsafe {
+                for (name, value) in &self.saved {
+                    match value {
+                        Some(v) => std::env::set_var(name, v),
+                        None => std::env::remove_var(name),
+                    }
+                }
+            }
+            crate::config::Config::reset();
+            crate::config::Config::init();
+        }
+    }
+
+    /// A nested save point inside a test that already holds an EnvGuard. It borrows the guard, so
+    /// the borrow checker refuses any order in which the guard (and its lock) is gone before the
+    /// snapshot restores.
+    pub struct EnvSnapshot<'a> {
+        raw: RawEnvSnapshot,
+        _guard: PhantomData<&'a EnvGuard>,
+    }
+
+    impl<'a> EnvSnapshot<'a> {
+        pub fn capture(_guard: &'a EnvGuard) -> Self {
+            Self {
+                raw: RawEnvSnapshot::capture(),
+                _guard: PhantomData,
+            }
+        }
+    }
+
+    impl Drop for EnvSnapshot<'_> {
+        fn drop(&mut self) {
+            self.raw.restore();
+        }
+    }
+
+    /// RAII guard: holds the process-wide env lock, saves every var in SAVED_ENV_VARS, and on drop
+    /// restores them and resets Config.
     pub struct EnvGuard {
-        saved_hcom: Option<String>,
-        saved_home: Option<String>,
-        saved_cursor_config_dir: Option<String>,
-        saved_xdg_config_home: Option<String>,
-        saved_xdg_data_home: Option<String>,
-        saved_codex_home: Option<String>,
-        saved_gemini_cli_home: Option<String>,
-        saved_kilo_config_dir: Option<String>,
-        saved_kimi_code_home: Option<String>,
-        saved_copilot_home: Option<String>,
-        saved_test_codex_cli_version: Option<String>,
-        saved_pi_coding_agent_dir: Option<String>,
-        saved_pi_coding_agent_session_dir: Option<String>,
-        saved_pi_config_dir: Option<String>,
-        saved_omp_profile: Option<String>,
-        saved_pi_profile: Option<String>,
+        raw: RawEnvSnapshot,
         // Declared last so it drops AFTER Drop::drop restores env vars,
         // releasing the lock only once this test's env state is gone.
         _lock: MutexGuard<'static, ()>,
@@ -69,23 +134,7 @@ pub mod test_helpers {
         pub fn new() -> Self {
             let lock = acquire_env_lock();
             Self {
-                saved_hcom: std::env::var("HCOM_DIR").ok(),
-                saved_home: std::env::var("HOME").ok(),
-                saved_cursor_config_dir: std::env::var("CURSOR_CONFIG_DIR").ok(),
-                saved_xdg_config_home: std::env::var("XDG_CONFIG_HOME").ok(),
-                saved_xdg_data_home: std::env::var("XDG_DATA_HOME").ok(),
-                saved_codex_home: std::env::var("CODEX_HOME").ok(),
-                saved_gemini_cli_home: std::env::var("GEMINI_CLI_HOME").ok(),
-                saved_kilo_config_dir: std::env::var("KILO_CONFIG_DIR").ok(),
-                saved_kimi_code_home: std::env::var("KIMI_CODE_HOME").ok(),
-                saved_copilot_home: std::env::var("COPILOT_HOME").ok(),
-                saved_test_codex_cli_version: std::env::var("HCOM_TEST_CODEX_CLI_VERSION").ok(),
-                saved_pi_coding_agent_dir: std::env::var("PI_CODING_AGENT_DIR").ok(),
-                saved_pi_coding_agent_session_dir: std::env::var("PI_CODING_AGENT_SESSION_DIR")
-                    .ok(),
-                saved_pi_config_dir: std::env::var("PI_CONFIG_DIR").ok(),
-                saved_omp_profile: std::env::var("OMP_PROFILE").ok(),
-                saved_pi_profile: std::env::var("PI_PROFILE").ok(),
+                raw: RawEnvSnapshot::capture(),
                 _lock: lock,
             }
         }
@@ -93,74 +142,7 @@ pub mod test_helpers {
 
     impl Drop for EnvGuard {
         fn drop(&mut self) {
-            unsafe {
-                match &self.saved_hcom {
-                    Some(v) => std::env::set_var("HCOM_DIR", v),
-                    None => std::env::remove_var("HCOM_DIR"),
-                }
-                match &self.saved_home {
-                    Some(v) => std::env::set_var("HOME", v),
-                    None => std::env::remove_var("HOME"),
-                }
-                match &self.saved_cursor_config_dir {
-                    Some(v) => std::env::set_var("CURSOR_CONFIG_DIR", v),
-                    None => std::env::remove_var("CURSOR_CONFIG_DIR"),
-                }
-                match &self.saved_xdg_config_home {
-                    Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
-                    None => std::env::remove_var("XDG_CONFIG_HOME"),
-                }
-                match &self.saved_xdg_data_home {
-                    Some(v) => std::env::set_var("XDG_DATA_HOME", v),
-                    None => std::env::remove_var("XDG_DATA_HOME"),
-                }
-                match &self.saved_codex_home {
-                    Some(v) => std::env::set_var("CODEX_HOME", v),
-                    None => std::env::remove_var("CODEX_HOME"),
-                }
-                match &self.saved_gemini_cli_home {
-                    Some(v) => std::env::set_var("GEMINI_CLI_HOME", v),
-                    None => std::env::remove_var("GEMINI_CLI_HOME"),
-                }
-                match &self.saved_kilo_config_dir {
-                    Some(v) => std::env::set_var("KILO_CONFIG_DIR", v),
-                    None => std::env::remove_var("KILO_CONFIG_DIR"),
-                }
-                match &self.saved_kimi_code_home {
-                    Some(v) => std::env::set_var("KIMI_CODE_HOME", v),
-                    None => std::env::remove_var("KIMI_CODE_HOME"),
-                }
-                match &self.saved_copilot_home {
-                    Some(v) => std::env::set_var("COPILOT_HOME", v),
-                    None => std::env::remove_var("COPILOT_HOME"),
-                }
-                match &self.saved_test_codex_cli_version {
-                    Some(v) => std::env::set_var("HCOM_TEST_CODEX_CLI_VERSION", v),
-                    None => std::env::remove_var("HCOM_TEST_CODEX_CLI_VERSION"),
-                }
-                match &self.saved_pi_coding_agent_dir {
-                    Some(v) => std::env::set_var("PI_CODING_AGENT_DIR", v),
-                    None => std::env::remove_var("PI_CODING_AGENT_DIR"),
-                }
-                match &self.saved_pi_coding_agent_session_dir {
-                    Some(v) => std::env::set_var("PI_CODING_AGENT_SESSION_DIR", v),
-                    None => std::env::remove_var("PI_CODING_AGENT_SESSION_DIR"),
-                }
-                match &self.saved_pi_config_dir {
-                    Some(v) => std::env::set_var("PI_CONFIG_DIR", v),
-                    None => std::env::remove_var("PI_CONFIG_DIR"),
-                }
-                match &self.saved_omp_profile {
-                    Some(v) => std::env::set_var("OMP_PROFILE", v),
-                    None => std::env::remove_var("OMP_PROFILE"),
-                }
-                match &self.saved_pi_profile {
-                    Some(v) => std::env::set_var("PI_PROFILE", v),
-                    None => std::env::remove_var("PI_PROFILE"),
-                }
-            }
-            crate::config::Config::reset();
-            crate::config::Config::init();
+            self.raw.restore();
         }
     }
 
@@ -168,6 +150,35 @@ pub mod test_helpers {
     /// Returns (tempdir, hcom_dir, test_home, guard).
     pub fn isolated_test_env() -> (tempfile::TempDir, PathBuf, PathBuf, EnvGuard) {
         let guard = EnvGuard::new();
+        let (dir, hcom_dir, test_home) = isolate_env_under_guard(&guard);
+        (dir, hcom_dir, test_home, guard)
+    }
+
+    /// Tool config-dir overrides that must never leak from the developer's shell into a test.
+    /// A Codex seat runs with CODEX_HOME set, a second Claude account with CLAUDE_CONFIG_DIR, and
+    /// so on; each one wins over HOME, so a test that only redirected HOME used to write its
+    /// fixtures into the live tool's hooks/settings files. Every name here is saved and restored
+    /// by EnvGuard.
+    pub const TOOL_HOME_OVERRIDES: &[&str] = &[
+        "CLAUDE_CONFIG_DIR",
+        "CURSOR_CONFIG_DIR",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+        "GEMINI_CLI_HOME",
+        "KILO_CONFIG_DIR",
+        "KIMI_CODE_HOME",
+        "COPILOT_HOME",
+        "PI_CODING_AGENT_DIR",
+        "PI_CODING_AGENT_SESSION_DIR",
+        "PI_CONFIG_DIR",
+        "OMP_PROFILE",
+        "PI_PROFILE",
+    ];
+
+    /// The body of isolated_test_env for a caller that already holds an EnvGuard (the env lock is
+    /// not re-entrant). Points HCOM_DIR, HOME and CODEX_HOME into a fresh tempdir and clears every
+    /// other tool-home override, so each tool's config dir falls back under that tempdir.
+    pub fn isolate_env_under_guard(_guard: &EnvGuard) -> (tempfile::TempDir, PathBuf, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
         let test_home = dir.path().to_path_buf();
         let hcom_dir = test_home.join(".hcom");
@@ -178,11 +189,17 @@ pub mod test_helpers {
         unsafe {
             std::env::set_var("HCOM_DIR", &hcom_dir);
             std::env::set_var("HOME", &test_home);
+            // Same place codex_config_dir() falls back to (tool_config_root()/.codex), set
+            // explicitly because CODEX_HOME is read before any fallback.
+            std::env::set_var("CODEX_HOME", test_home.join(".codex"));
             std::env::set_var("HCOM_TEST_CODEX_CLI_VERSION", "codex-cli 0.129.0");
+            for name in TOOL_HOME_OVERRIDES {
+                std::env::remove_var(name);
+            }
         }
         crate::config::Config::reset();
         crate::config::Config::init();
-        (dir, hcom_dir, test_home, guard)
+        (dir, hcom_dir, test_home)
     }
 }
 

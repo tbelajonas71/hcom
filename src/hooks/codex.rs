@@ -3104,6 +3104,59 @@ mod tests {
         );
     }
 
+    /// A Codex seat runs `cargo test` with CODEX_HOME pointing at its live config. On 2026-11-18
+    /// test_setup_preserves_unrelated_hooks wrote its fixture "other-hook" into that live
+    /// hooks.json, and every new Codex body then stopped at "Hooks need review". The isolated
+    /// env must win over an inherited CODEX_HOME (and the other tool-home overrides).
+    #[test]
+    #[serial]
+    fn test_isolated_env_ignores_inherited_codex_home() {
+        let _guard = EnvGuard::new();
+        let live = tempfile::tempdir().unwrap();
+        let live_codex = live.path().join("codex-live");
+        std::fs::create_dir_all(&live_codex).unwrap();
+        let live_hooks = live_codex.join("hooks.json");
+        std::fs::write(&live_hooks, "{\"hooks\":{}}").unwrap();
+        unsafe {
+            std::env::set_var("CODEX_HOME", &live_codex);
+            std::env::set_var("CLAUDE_CONFIG_DIR", live.path().join("claude-live"));
+            std::env::set_var("GEMINI_CLI_HOME", live.path().join("gemini-live"));
+        }
+
+        let (_tmp, _hcom_dir, test_home) = crate::hooks::test_helpers::isolate_env_under_guard();
+        let hooks_path = get_codex_hooks_path();
+        assert!(hooks_path.starts_with(&test_home), "{hooks_path:?} not under {test_home:?}");
+        assert_eq!(hooks_path, test_home.join(".codex").join("hooks.json"));
+        for name in crate::hooks::test_helpers::TOOL_HOME_OVERRIDES {
+            assert!(std::env::var(name).is_err(), "{name} still set inside the isolated env");
+        }
+
+        assert!(setup_codex_hooks(false));
+        assert!(hooks_path.exists());
+        assert_eq!(std::fs::read_to_string(&live_hooks).unwrap(), "{\"hooks\":{}}");
+        assert_eq!(std::fs::read_dir(&live_codex).unwrap().count(), 1);
+    }
+
+    #[test]
+    #[serial]
+    fn test_env_guard_restores_claude_config_dir() {
+        let outer = tempfile::tempdir().unwrap();
+        let before;
+        {
+            let _guard = EnvGuard::new();
+            before = std::env::var("CLAUDE_CONFIG_DIR").ok();
+            {
+                let _inner_tmp;
+                unsafe { std::env::set_var("CLAUDE_CONFIG_DIR", outer.path()) };
+                // simulate a test body that isolates and then returns
+                _inner_tmp = crate::hooks::test_helpers::isolate_env_under_guard();
+                assert!(std::env::var("CLAUDE_CONFIG_DIR").is_err());
+            }
+        }
+        let _check = EnvGuard::new();
+        assert_eq!(std::env::var("CLAUDE_CONFIG_DIR").ok(), before);
+    }
+
     #[test]
     #[serial]
     fn test_setup_preserves_unrelated_hooks() {

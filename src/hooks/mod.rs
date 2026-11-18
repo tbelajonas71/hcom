@@ -40,6 +40,7 @@ pub mod test_helpers {
     pub struct EnvGuard {
         saved_hcom: Option<String>,
         saved_home: Option<String>,
+        saved_claude_config_dir: Option<String>,
         saved_cursor_config_dir: Option<String>,
         saved_xdg_config_home: Option<String>,
         saved_xdg_data_home: Option<String>,
@@ -71,6 +72,7 @@ pub mod test_helpers {
             Self {
                 saved_hcom: std::env::var("HCOM_DIR").ok(),
                 saved_home: std::env::var("HOME").ok(),
+                saved_claude_config_dir: std::env::var("CLAUDE_CONFIG_DIR").ok(),
                 saved_cursor_config_dir: std::env::var("CURSOR_CONFIG_DIR").ok(),
                 saved_xdg_config_home: std::env::var("XDG_CONFIG_HOME").ok(),
                 saved_xdg_data_home: std::env::var("XDG_DATA_HOME").ok(),
@@ -101,6 +103,10 @@ pub mod test_helpers {
                 match &self.saved_home {
                     Some(v) => std::env::set_var("HOME", v),
                     None => std::env::remove_var("HOME"),
+                }
+                match &self.saved_claude_config_dir {
+                    Some(v) => std::env::set_var("CLAUDE_CONFIG_DIR", v),
+                    None => std::env::remove_var("CLAUDE_CONFIG_DIR"),
                 }
                 match &self.saved_cursor_config_dir {
                     Some(v) => std::env::set_var("CURSOR_CONFIG_DIR", v),
@@ -168,6 +174,35 @@ pub mod test_helpers {
     /// Returns (tempdir, hcom_dir, test_home, guard).
     pub fn isolated_test_env() -> (tempfile::TempDir, PathBuf, PathBuf, EnvGuard) {
         let guard = EnvGuard::new();
+        let (dir, hcom_dir, test_home) = isolate_env_under_guard();
+        (dir, hcom_dir, test_home, guard)
+    }
+
+    /// Tool config-dir overrides that must never leak from the developer's shell into a test.
+    /// A Codex seat runs with CODEX_HOME set, a second Claude account with CLAUDE_CONFIG_DIR, and
+    /// so on; each one wins over HOME, so a test that only redirected HOME used to write its
+    /// fixtures into the live tool's hooks/settings files. Every name here is saved and restored
+    /// by EnvGuard.
+    pub const TOOL_HOME_OVERRIDES: &[&str] = &[
+        "CLAUDE_CONFIG_DIR",
+        "CURSOR_CONFIG_DIR",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+        "GEMINI_CLI_HOME",
+        "KILO_CONFIG_DIR",
+        "KIMI_CODE_HOME",
+        "COPILOT_HOME",
+        "PI_CODING_AGENT_DIR",
+        "PI_CODING_AGENT_SESSION_DIR",
+        "PI_CONFIG_DIR",
+        "OMP_PROFILE",
+        "PI_PROFILE",
+    ];
+
+    /// The body of isolated_test_env for a caller that already holds an EnvGuard (the env lock is
+    /// not re-entrant). Points HCOM_DIR, HOME and CODEX_HOME into a fresh tempdir and clears every
+    /// other tool-home override, so each tool's config dir falls back under that tempdir.
+    pub fn isolate_env_under_guard() -> (tempfile::TempDir, PathBuf, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
         let test_home = dir.path().to_path_buf();
         let hcom_dir = test_home.join(".hcom");
@@ -178,11 +213,17 @@ pub mod test_helpers {
         unsafe {
             std::env::set_var("HCOM_DIR", &hcom_dir);
             std::env::set_var("HOME", &test_home);
+            // Same place codex_config_dir() falls back to (tool_config_root()/.codex), set
+            // explicitly because CODEX_HOME is read before any fallback.
+            std::env::set_var("CODEX_HOME", test_home.join(".codex"));
             std::env::set_var("HCOM_TEST_CODEX_CLI_VERSION", "codex-cli 0.129.0");
+            for name in TOOL_HOME_OVERRIDES {
+                std::env::remove_var(name);
+            }
         }
         crate::config::Config::reset();
         crate::config::Config::init();
-        (dir, hcom_dir, test_home, guard)
+        (dir, hcom_dir, test_home)
     }
 }
 

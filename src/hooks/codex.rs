@@ -3111,7 +3111,7 @@ mod tests {
     #[test]
     #[serial]
     fn test_isolated_env_ignores_inherited_codex_home() {
-        let _guard = EnvGuard::new();
+        let guard = EnvGuard::new();
         let live = tempfile::tempdir().unwrap();
         let live_codex = live.path().join("codex-live");
         std::fs::create_dir_all(&live_codex).unwrap();
@@ -3119,11 +3119,14 @@ mod tests {
         std::fs::write(&live_hooks, "{\"hooks\":{}}").unwrap();
         unsafe {
             std::env::set_var("CODEX_HOME", &live_codex);
-            std::env::set_var("CLAUDE_CONFIG_DIR", live.path().join("claude-live"));
-            std::env::set_var("GEMINI_CLI_HOME", live.path().join("gemini-live"));
+            // Seed every other override too, so the check below proves each one was cleared.
+            for name in crate::hooks::test_helpers::TOOL_HOME_OVERRIDES {
+                std::env::set_var(name, live.path().join(name.to_ascii_lowercase()));
+            }
         }
 
-        let (_tmp, _hcom_dir, test_home) = crate::hooks::test_helpers::isolate_env_under_guard();
+        let (_tmp, _hcom_dir, test_home) =
+            crate::hooks::test_helpers::isolate_env_under_guard(&guard);
         let hooks_path = get_codex_hooks_path();
         assert!(
             hooks_path.starts_with(&test_home),
@@ -3148,22 +3151,31 @@ mod tests {
 
     #[test]
     #[serial]
-    fn test_env_guard_restores_claude_config_dir() {
+    fn test_env_snapshot_restores_a_set_claude_config_dir_and_clears_an_unset_one() {
+        use crate::hooks::test_helpers::{EnvSnapshot, SAVED_ENV_VARS, isolate_env_under_guard};
+        assert!(SAVED_ENV_VARS.contains(&"CLAUDE_CONFIG_DIR"));
+        let guard = EnvGuard::new();
         let outer = tempfile::tempdir().unwrap();
-        let before;
+
+        // Saved as Some(outer): isolation clears it, the snapshot's drop puts it back.
+        unsafe { std::env::set_var("CLAUDE_CONFIG_DIR", outer.path()) };
         {
-            let _guard = EnvGuard::new();
-            before = std::env::var("CLAUDE_CONFIG_DIR").ok();
-            {
-                let _inner_tmp;
-                unsafe { std::env::set_var("CLAUDE_CONFIG_DIR", outer.path()) };
-                // simulate a test body that isolates and then returns
-                _inner_tmp = crate::hooks::test_helpers::isolate_env_under_guard();
-                assert!(std::env::var("CLAUDE_CONFIG_DIR").is_err());
-            }
+            let _snapshot = EnvSnapshot::capture(&guard);
+            let _isolated = isolate_env_under_guard(&guard);
+            assert!(std::env::var("CLAUDE_CONFIG_DIR").is_err());
         }
-        let _check = EnvGuard::new();
-        assert_eq!(std::env::var("CLAUDE_CONFIG_DIR").ok(), before);
+        assert_eq!(
+            std::env::var("CLAUDE_CONFIG_DIR").ok().as_deref(),
+            outer.path().to_str()
+        );
+
+        // Saved as None: a value set afterwards is removed again on drop.
+        unsafe { std::env::remove_var("CLAUDE_CONFIG_DIR") };
+        {
+            let _snapshot = EnvSnapshot::capture(&guard);
+            unsafe { std::env::set_var("CLAUDE_CONFIG_DIR", outer.path()) };
+        }
+        assert!(std::env::var("CLAUDE_CONFIG_DIR").is_err());
     }
 
     #[test]
